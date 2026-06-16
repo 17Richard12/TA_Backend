@@ -3,3 +3,6 @@ uvicorn[standard]==0.30.6
 firebase-admin==6.5.0
 pydantic[email]==2.7.4
 python-dotenv==1.0.1
+google-adk
+google-generativeai
+google-genai
