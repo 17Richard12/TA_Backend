@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.user_router import router as user_router
 from routers.chat_router import router as chat_router
+from routers.activity_router import router as activity_router
+from routers.smoke_router import router as smoke_router
 from google.adk.runners import InMemoryRunner
 from myAgent.agent import root_agent
 
@@ -24,7 +26,8 @@ app.state.runner = runner
 
 app.include_router(user_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
-
+app.include_router(activity_router, prefix="/api")
+app.include_router(smoke_router, prefix="/api")
 
 @app.get("/", tags=["Health"])
 def health_check():
