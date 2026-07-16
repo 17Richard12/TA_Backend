@@ -152,6 +152,9 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
     # 2. Kirim session_id ke client
     yield f"data: [SESSION]{session_id}\n\n"
 
+    loading_text = "*(Menganalisis gejala...)*\n\n"
+    yield f"data: {json.dumps(loading_text)}\n\n"
+
     # 3. Stream token dari agent
     content = types.Content(
         role="user",
@@ -165,23 +168,30 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
             session_id=session_id,
             new_message=content,
         ):
-            if (
-                not event.is_final_response()
-                and event.content
-                and event.content.parts
-            ):
+            # Ambil bagian teks dari event apa pun (final atau non-final)
+            if event.content and event.content.parts:
                 for part in event.content.parts:
-                    if part.text:
-                        full_response += part.text
-                        # Encode sebagai JSON agar \n dalam teks tidak merusak format SSE
-                        yield f"data: {json.dumps(part.text)}\n\n"
-
-            elif event.is_final_response():
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if part.text and part.text not in full_response:
-                            full_response += part.text
-                            yield f"data: {json.dumps(part.text)}\n\n"
+                    text_chunk = part.text
+                    
+                    # Pastikan teks tidak kosong dan belum pernah dikirim (mencegah duplikasi di event final)
+                    if text_chunk and text_chunk not in full_response:
+                        full_response += text_chunk
+                        
+                        # TOKEN SIMULATOR: 
+                        # Jika teks yang diterima sangat besar (ciri khas hasil Tool Call RAG)
+                        if len(text_chunk) > 30:
+                            # Pecah menjadi kata per kata
+                            words = text_chunk.split(" ")
+                            for i, word in enumerate(words):
+                                # Kembalikan spasi yang hilang
+                                spaced_word = word + (" " if i < len(words) - 1 else "")
+                                yield f"data: {json.dumps(spaced_word)}\n\n"
+                                # Jeda buatan 20 milidetik per kata agar natural
+                                await asyncio.sleep(0.02) 
+                        else:
+                            # Jika LLM memang mengirim token kecil secara natural, langsung yield
+                            yield f"data: {json.dumps(text_chunk)}\n\n"
+                            await asyncio.sleep(0.01)
 
     except Exception as e:
         yield f"data: [ERROR]{str(e)}\n\n"
@@ -189,6 +199,7 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
 
     if not full_response:
         full_response = "Agent tidak memberikan respons."
+        yield f"data: {json.dumps(full_response)}\n\n"
 
     # 4. Simpan ke Firestore (subcollection messages)
     doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session)
