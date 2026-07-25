@@ -6,6 +6,7 @@ load_dotenv()
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools import google_search
+from tools import search_medical_journal
 from prompt import COORDINATOR_PROMPT, SYMPTOM_ANALYZER_PROMPT, HOME_REMEDIES_PROMPT
 
 model = "gemini-3.5-flash"
@@ -16,7 +17,7 @@ symptom_analyzer = LlmAgent(
     model=model,
     description="Asisten medis spesialis paru-paru yang menganalisis gejala pernapasan dan efek merokok.", # <-- Diperbarui
     instruction=SYMPTOM_ANALYZER_PROMPT,
-    tools=[google_search]
+    tools=[search_medical_journal]
 )
 
 # 2. Sub-Agent: Rawatan Rumahan Pernapasan
