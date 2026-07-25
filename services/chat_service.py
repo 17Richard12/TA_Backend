@@ -152,9 +152,6 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
     # 2. Kirim session_id ke client
     yield f"data: [SESSION]{session_id}\n\n"
 
-    loading_text = "*(Menganalisis gejala...)*\n\n"
-    yield f"data: {json.dumps(loading_text)}\n\n"
-
     # 3. Stream token dari agent
     content = types.Content(
         role="user",
