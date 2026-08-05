@@ -140,3 +140,24 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
         "action": "generated_and_inserted", # Status bahwa ini dari AI
         "activities": saved_activities
     }
+
+def update_activity_status(daily_activity_id: str, activity_id: str, is_done: bool) -> dict:
+    """Mengupdate status done pada sub-collection activities."""
+    activity_ref = db.collection(DAILY_ACT_COL).document(daily_activity_id) \
+                     .collection(ACT_SUB_COL).document(activity_id)
+
+    # Cek apakah dokumen ada
+    activity_doc = activity_ref.get()
+    if not activity_doc.exists:
+        return None
+
+    # Update field 'done'
+    activity_ref.update({
+        'done': is_done
+    })
+
+    return {
+        "daily_activity_id": daily_activity_id,
+        "activity_id": activity_id,
+        "done": is_done
+    }
