@@ -15,3 +15,6 @@ class DailyActivityResponse(BaseModel):
     user_uid: str
     timestamp: str
     activities: List[ActivityItem]
+
+class UpdateChecklistSchema(BaseModel):
+    done: bool
