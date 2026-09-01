@@ -65,20 +65,22 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
             db.collection("smokeCount")
             .where(filter=FieldFilter("userID", "==", user_uid))
             .order_by("timestamp", direction="DESCENDING")
-            .limit(5)
+            .limit(2) # Ambil 2 terakhir untuk memastikan kita dapat hari sebelumnya jika hari ini sudah ada
             .stream()
         )
         
-        total_smokes = 0
-        days_counted = 0
+        smoke_count_yesterday = 0
         for doc in smoke_docs:
             data = doc.to_dict()
-            total_smokes += data.get("count", 0)
-            days_counted += 1
+            doc_ts = data.get("timestamp", "")
+            if doc_ts < timestamp: # Ambil yang sebelum timestamp hari ini (kemarin)
+                smoke_count_yesterday = data.get("count", 0)
+                break
     except Exception as e:
         print(f"Error fetching smokeCount: {e}")
-        total_smokes = 0
-        days_counted = 0
+        smoke_count_yesterday = 0
+
+    target_activities_count = smoke_count_yesterday + 1
 
     # Panggil Gemini
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -86,12 +88,12 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
     
     prompt = f"""
     Pengguna ini sedang mencoba berhenti merokok.
-    Dalam {max(days_counted, 1)} catatan hari terakhir, mereka telah mengonsumsi total {total_smokes} batang rokok.
-    Berikan tepat 5 aktivitas harian spesifik, praktis, dan sehat yang dapat dilakukan untuk menggantikan kebiasaan merokok dan mengatasi rasa ingin merokok (craving).
+    Kemarin, mereka telah mengonsumsi total {smoke_count_yesterday} batang rokok.
+    Berikan tepat {target_activities_count} aktivitas harian spesifik, praktis, dan sehat yang dapat dilakukan hari ini untuk menggantikan kebiasaan merokok dan mengatasi rasa ingin merokok (craving).
     
-    Format output HARUS HANYA berupa array JSON berisi 5 string, tanpa markdown, tanpa penjelasan tambahan.
-    Contoh output yang valid: 
-    ["Minum air putih perlahan", "Jalan kaki 15 menit", "Latihan napas dalam 5 menit", "Mengunyah permen karet bebas gula", "Mendengarkan musik relaksasi"]
+    Format output HARUS HANYA berupa array JSON berisi {target_activities_count} string, tanpa markdown, tanpa penjelasan tambahan.
+    Contoh output yang valid jika diminta 2 aktivitas: 
+    ["Minum air putih perlahan", "Jalan kaki 15 menit"]
     """
 
     try:
@@ -100,14 +102,20 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
         activities_list = json.loads(raw_text)
     except Exception as e:
         print(f"Error calling Gemini or parsing JSON: {e}")
-        # Default jika gagal
-        activities_list = [
+        # Default jika gagal (sejumlah target_activities_count)
+        default_acts = [
             "Latihan Napas Dalam (Deep Breathing)",
             "Minum segelas air putih perlahan",
             "Jalan kaki singkat selama 10 menit",
             "Mengunyah permen karet bebas gula",
-            "Mencuci muka dengan air dingin"
+            "Mencuci muka dengan air dingin",
+            "Mendengarkan musik relaksasi",
+            "Membaca buku 15 menit"
         ]
+        activities_list = default_acts[:target_activities_count]
+        # Jika kurang dari target, ulangi beberapa aktivitas
+        while len(activities_list) < target_activities_count:
+            activities_list.append("Minum air putih tambahan")
 
     # Simpan ke Firestore (Tabel Utama)
     daily_activity_id = _new_id()
@@ -118,7 +126,7 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
 
     # Simpan ke Sub-collection
     saved_activities = []
-    for act in activities_list[:5]:
+    for act in activities_list[:target_activities_count]:
         act_id = _new_id()
         act_data = {
             "activity": act,

@@ -7,7 +7,7 @@ router = APIRouter(prefix="/smoke-count", tags=["Smoke Count"])
 # Endpoint GET baru menggunakan query parameters
 @router.get("/", summary="Get data smoke count berdasarkan userID dan timestamp")
 def get_smoke(
-    user_id: str = Query(..., alias="userid"), 
+    user_id: str = Query(...), 
     timestamp: str = Query(..., description="Format: dd/mm/yyyy")
 ):
     return smoke_controller.get_smoke(user_id, timestamp)

@@ -7,12 +7,14 @@ SMOKE_COL = "smokeCount"
 def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:20]
 
+from google.cloud.firestore_v1.base_query import FieldFilter
+
 def _find_smoke_doc(user_id: str, timestamp: str):
     """Mencari dokumen berdasarkan userID dan timestamp."""
     docs = (
         db.collection(SMOKE_COL)
-        .where("userID", "==", user_id)
-        .where("timestamp", "==", timestamp)
+        .where(filter=FieldFilter("userID", "==", user_id))
+        .where(filter=FieldFilter("timestamp", "==", timestamp))
         .limit(1)
         .stream()
     )
