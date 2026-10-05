@@ -54,3 +54,22 @@ def change_password(uid: str, payload: ChangePasswordSchema):
 def _sanitize(user: dict) -> dict:
     """Remove sensitive fields before returning to client."""
     return {k: v for k, v in user.items() if k != "password"}
+
+def get_all_users():
+    users = user_service.get_all_users()
+    # Looping untuk menghapus field password dari masing-masing user
+    sanitized_users = [_sanitize(user) for user in users]
+    
+    return {
+        "status": "success",
+        "data": sanitized_users
+    }
+
+def get_patients():
+    users = user_service.get_patients()
+    sanitized_users = [_sanitize(user) for user in users]
+    
+    return {
+        "status": "success",
+        "data": sanitized_users
+    }

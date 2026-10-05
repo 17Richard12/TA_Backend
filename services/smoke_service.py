@@ -1,6 +1,8 @@
 import uuid
 from config.firebase import db
 from schemas.smoke_schema import SmokeCountSchema
+from google.cloud.firestore_v1.base_query import FieldFilter
+from datetime import datetime, timedelta, timezone
 
 SMOKE_COL = "smokeCount"
 
@@ -38,6 +40,12 @@ def post_smoke_count(payload: SmokeCountSchema) -> dict:
         "count": payload.total  # Disimpan sebagai 'count' sesuai struktur gambar Firestore
     })
     
+    # Simpan logdate di subcollection
+    log_id = _new_id()
+    db.collection(SMOKE_COL).document(new_doc_id).collection("logs").document(log_id).set({
+        "logdate": datetime.now(timezone.utc)
+    })
+    
     return {
         "id": new_doc_id,
         "action": "inserted",
@@ -55,6 +63,12 @@ def update_smoke_count(payload: SmokeCountSchema) -> dict:
             "timestamp": payload.timestamp,
             "count": payload.total
         })
+        
+        log_id = _new_id()
+        db.collection(SMOKE_COL).document(new_doc_id).collection("logs").document(log_id).set({
+            "logdate": datetime.now(timezone.utc)
+        })
+
         return {
             "id": new_doc_id,
             "action": "inserted_via_update",
@@ -64,6 +78,11 @@ def update_smoke_count(payload: SmokeCountSchema) -> dict:
     # Jika data sudah ada, lakukan update saja pada field count
     db.collection(SMOKE_COL).document(doc_id).update({
         "count": payload.total
+    })
+    
+    log_id = _new_id()
+    db.collection(SMOKE_COL).document(doc_id).collection("logs").document(log_id).set({
+        "logdate": datetime.now(timezone.utc)
     })
     
     return {
@@ -91,3 +110,49 @@ def get_smoke_count(user_id: str, timestamp: str) -> dict:
         "timestamp": existing_data.get("timestamp"),
         "count": existing_data.get("count", 0)
     }
+
+def get_weekly_report(user_id: str, end_timestamp: str) -> list:
+    try:
+        # 1. Konversi input (dd/mm/yyyy dari frontend/postman) menjadi objek datetime
+        end_date = datetime.strptime(end_timestamp, "%d/%m/%Y")
+    except ValueError:
+        raise ValueError("Format tanggal tidak valid. Gunakan dd/mm/yyyy")
+
+    # 2. Buat list tanggal untuk Query ke Database (Wajib YYYY-MM-DD sesuai screenshot)
+    date_list_db = [(end_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    date_list_db.reverse() 
+    
+    # Cetak ke terminal untuk memastikan format yang dicari benar
+    print("Mencari di DB dengan tanggal:", date_list_db)
+
+    # Buat list tanggal untuk ditampilkan ke Response JSON (Format DD/MM/YYYY)
+    date_list_display = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(7)]
+    date_list_display.reverse()
+
+    # 3. Query ke Firestore
+    docs = (
+        db.collection(SMOKE_COL)
+        .where(filter=FieldFilter("userID", "==", user_id))
+        .where(filter=FieldFilter("timestamp", "in", date_list_db))
+        .stream()
+    )
+
+    # 4. Mapping data hasil pencarian
+    db_data = {}
+    for doc in docs:
+        data = doc.to_dict()
+        # Menyimpan data dengan key format YYYY-MM-DD
+        db_data[data["timestamp"]] = data.get("count", 0)
+
+    # 5. Gabungkan menjadi array response akhir
+    report_data = []
+    for i in range(7):
+        db_format = date_list_db[i]           # contoh: "2026-09-24"
+        display_format = date_list_display[i] # contoh: "24/09/2026"
+        
+        report_data.append({
+            "timestamp": display_format, 
+            "count": db_data.get(db_format, 0) 
+        })
+
+    return report_data

@@ -59,24 +59,29 @@ def _save_message(session_doc_id: str, role: str, response: str):
         })
 
 
-def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: bool) -> str:
+def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: bool, first_message: str = "") -> str:
     """Return doc_id session. Buat baru jika belum ada."""
     if is_new_session:
         doc_id = _new_id()
+        title = _generate_title(first_message) if first_message else "Konsultasi Kesehatan"
         db.collection(CHATS_COL).document(doc_id).set({
             "user": user_uid,
             "sessionID": session_id,
+            "title": title,
         })
         return doc_id
     else:
         doc_id, existing = _find_session_doc(session_id)
         if doc_id:
+            # Jika dokumen sudah ada, pastikan tidak menimpa title yang sudah ada
             return doc_id
         # Session ada di ADK tapi belum ada di Firestore → buat baru
         doc_id = _new_id()
+        title = _generate_title(first_message) if first_message else "Konsultasi Kesehatan"
         db.collection(CHATS_COL).document(doc_id).set({
             "user": user_uid,
             "sessionID": session_id,
+            "title": title,
         })
         return doc_id
 
@@ -125,7 +130,7 @@ async def post_chat(payload: PostChatSchema, runner) -> dict:
         final_response = "Agent tidak memberikan respons."
 
     # 3. Simpan ke Firestore (subcollection messages)
-    doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session)
+    doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session, payload.message)
     _save_message(doc_id, "user", payload.message)
     _save_message(doc_id, "ai", final_response)
 
@@ -199,7 +204,7 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
         yield f"data: {json.dumps(full_response)}\n\n"
 
     # 4. Simpan ke Firestore (subcollection messages)
-    doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session)
+    doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session, payload.message)
     _save_message(doc_id, "user", payload.message)
     _save_message(doc_id, "ai", full_response)
 
@@ -240,7 +245,7 @@ def _generate_title(first_message: str) -> str:
     """Generate judul singkat dari pesan pertama user menggunakan Gemini."""
     try:
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-3.5-flash")
         response = model.generate_content(
             f"Buatkan judul singkat maksimal 5 kata dalam Bahasa Indonesia "
             f"untuk percakapan yang dimulai dengan pesan berikut. "
@@ -261,18 +266,6 @@ def get_chat_history(user_uid: str) -> list:
 
     history = []
     for doc_id, doc in results:
-        # Ambil pesan pertama sebagai title source (selalu dari user)
-        first_msgs = (
-            db.collection(CHATS_COL).document(doc_id)
-            .collection(MESSAGES_COL)
-            .order_by("timestamp")
-            .limit(1)
-            .stream()
-        )
-        first_message = ""
-        for msg in first_msgs:
-            first_message = msg.to_dict().get("response", "")
-
         # Ambil timestamp pesan terakhir untuk sorting
         last_msgs = (
             db.collection(CHATS_COL).document(doc_id)
@@ -285,8 +278,10 @@ def get_chat_history(user_uid: str) -> list:
         for msg in last_msgs:
             last_timestamp = msg.to_dict().get("timestamp", "")
 
-        # Generate judul dari pesan pertama
-        title = _generate_title(first_message) if first_message else "Konsultasi Kesehatan"
+        # Ambil judul dari field database (sudah digenerate saat create session)
+        title = doc.get("title")
+        if not title:
+            title = "Konsultasi Kesehatan"
 
         history.append({
             "session_id": doc.get("sessionID"),

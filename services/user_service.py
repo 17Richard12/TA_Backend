@@ -47,6 +47,7 @@ def register_user(payload: RegisterSchema) -> dict:
         "name": payload.name,
         "email": payload.email,
         "password": _hash_password(payload.password),
+        "role": payload.role,
         "birth": "",
         "bloodType": "",
         "gender": "",
@@ -100,3 +101,23 @@ def change_password(uid: str, payload: ChangePasswordSchema) -> dict:
         {"password": _hash_password(payload.new_password)}
     )
     return {"message": "Password changed successfully"}
+
+def get_all_users() -> list:
+    """Mengambil semua data user dari Firestore."""
+    docs = db.collection(ACCOUNTS_COL).stream()
+    users = []
+    for doc in docs:
+        users.append({"uid": doc.id, **doc.to_dict()})
+    return users
+
+def get_patients() -> list:
+    """Mengambil semua data user yang memiliki role 'user' saja (untuk dokter)."""
+    docs = (
+        db.collection(ACCOUNTS_COL)
+        .where(filter=FieldFilter("role", "==", "user"))
+        .stream()
+    )
+    users = []
+    for doc in docs:
+        users.append({"uid": doc.id, **doc.to_dict()})
+    return users

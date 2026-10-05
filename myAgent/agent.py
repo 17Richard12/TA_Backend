@@ -9,7 +9,7 @@ from google.adk.tools import google_search
 from tools import search_medical_journal
 from prompt import COORDINATOR_PROMPT, SYMPTOM_ANALYZER_PROMPT, HOME_REMEDIES_PROMPT
 
-model = "gemini-3.5-flash"
+model = "gemini-3.7-flash"
 
 # 1. Sub-Agent: Analisis Gejala Paru
 symptom_analyzer = LlmAgent(

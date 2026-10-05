@@ -21,3 +21,43 @@ def update_checklist_status(daily_activity_id: str, activity_id: str, payload: U
         "message": "Checklist status updated successfully",
         "data": result
     }
+
+def get_activity_report(user_id: str, timestamp: str):
+    try:
+        result = activity_service.get_weekly_activity_report(user_id, timestamp)
+        return {
+            "status": "success",
+            "data": result
+        }
+    except ValueError as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Terjadi kesalahan pada server",
+            "detail": str(e)
+        }
+
+def get_streak_count(user_id: str, timestamp: str):
+    try:
+        streak = activity_service.get_activity_streak(user_id, timestamp)
+        return {
+            "status": "success",
+            "data": {
+                "streak": streak
+            }
+        }
+    except ValueError as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Terjadi kesalahan pada server",
+            "detail": str(e)
+        }

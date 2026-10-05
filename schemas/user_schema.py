@@ -7,6 +7,8 @@ class RegisterSchema(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     email: EmailStr
     password: str = Field(..., min_length=6)
+    role: str = "user"
+
 
 
 class LoginSchema(BaseModel):
@@ -23,6 +25,7 @@ class EditAccountSchema(BaseModel):
     weight: Optional[float] = None
     phone: Optional[str] = None
     history: Optional[str] = None
+    role: Optional[str] = None
 
 
 class ChangePasswordSchema(BaseModel):
@@ -33,6 +36,7 @@ class UserResponse(BaseModel):
     uid: str
     name: str
     email: str
+    role: str = "user"
     birth: Optional[str] = None
     bloodType: Optional[str] = None
     gender: Optional[str] = None

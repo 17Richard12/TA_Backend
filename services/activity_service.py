@@ -6,6 +6,7 @@ import google.generativeai as genai
 from google.cloud.firestore_v1.base_query import FieldFilter # <-- IMPORT PENTING
 from config.firebase import db
 from schemas.activity_schema import GenerateActivitySchema
+from datetime import datetime, timedelta
 
 DAILY_ACT_COL = "dailyActivities"
 ACT_SUB_COL = "activities"
@@ -61,21 +62,38 @@ def get_or_create_daily_activities(payload: GenerateActivitySchema) -> dict:
 
     # 2. JIKA BELUM ADA: Baru lakukan fetch ke AI dan Insert ke Firebase
     try:
+        from datetime import datetime
         smoke_docs = (
             db.collection("smokeCount")
             .where(filter=FieldFilter("userID", "==", user_uid))
-            .order_by("timestamp", direction="DESCENDING")
-            .limit(2) # Ambil 2 terakhir untuk memastikan kita dapat hari sebelumnya jika hari ini sudah ada
             .stream()
         )
         
-        smoke_count_yesterday = 0
+        # Ambil semua data smoke count user ini
+        smoke_records = []
         for doc in smoke_docs:
             data = doc.to_dict()
             doc_ts = data.get("timestamp", "")
-            if doc_ts < timestamp: # Ambil yang sebelum timestamp hari ini (kemarin)
-                smoke_count_yesterday = data.get("count", 0)
+            try:
+                # Format dari database ternyata adalah YYYY-MM-DD
+                dt = datetime.strptime(doc_ts, "%Y-%m-%d")
+                smoke_records.append({"date": dt, "count": data.get("count", 0)})
+            except ValueError:
+                continue
+                
+        # Urutkan berdasarkan tanggal menurun (terbaru ke terlama)
+        smoke_records.sort(key=lambda x: x["date"], reverse=True)
+        
+        # Konversi timestamp hari ini ke datetime
+        today_dt = datetime.strptime(timestamp, "%Y-%m-%d")
+        
+        smoke_count_yesterday = 0
+        for record in smoke_records:
+            # Ambil record pertama yang tanggalnya sebelum hari ini
+            if record["date"] < today_dt:
+                smoke_count_yesterday = record["count"]
                 break
+                
     except Exception as e:
         print(f"Error fetching smokeCount: {e}")
         smoke_count_yesterday = 0
@@ -169,3 +187,128 @@ def update_activity_status(daily_activity_id: str, activity_id: str, is_done: bo
         "activity_id": activity_id,
         "done": is_done
     }
+
+def get_weekly_activity_report(user_id: str, end_timestamp: str) -> list:
+    """
+    Mengambil data jumlah aktivitas yang selesai (done == True) selama 7 hari ke belakang.
+    Format input end_timestamp: dd/mm/yyyy
+    """
+    try:
+        # Konversi input (dd/mm/yyyy) menjadi objek datetime
+        end_date = datetime.strptime(end_timestamp, "%d/%m/%Y")
+    except ValueError:
+        raise ValueError("Format tanggal tidak valid. Gunakan dd/mm/yyyy")
+
+    # Buat list tanggal untuk Query ke Database (Format YYYY-MM-DD sesuai struktur database)
+    date_list_db = [(end_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    date_list_db.reverse() 
+    
+    # Buat list tanggal untuk ditampilkan ke Response JSON (Format DD/MM/YYYY)
+    date_list_display = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(7)]
+    date_list_display.reverse()
+
+    # Query ke Firestore untuk mencari dokumen harian dalam 7 hari terakhir
+    docs = (
+        db.collection(DAILY_ACT_COL)
+        .where(filter=FieldFilter("userID", "==", user_id))
+        .where(filter=FieldFilter("timestamp", "in", date_list_db))
+        .stream()
+    )
+
+    db_data = {}
+    for doc in docs:
+        data = doc.to_dict()
+        timestamp_db = data.get("timestamp")
+        
+        # Ambil sub-collection 'activities' pada dokumen harian ini
+        # Dan filter HANYA yang status done == True
+        sub_docs = (
+            doc.reference.collection(ACT_SUB_COL)
+            .where(filter=FieldFilter("done", "==", True))
+            .stream()
+        )
+        
+        # Hitung jumlah aktivitas yang selesai
+        done_count = sum(1 for _ in sub_docs)
+        db_data[timestamp_db] = done_count
+
+    # Gabungkan menjadi array response
+    report_data = []
+    for i in range(7):
+        db_format = date_list_db[i]           
+        display_format = date_list_display[i] 
+        
+        report_data.append({
+            "timestamp": display_format, 
+            "count": db_data.get(db_format, 0) # Jika tidak ada data, hitungan selesai = 0
+        })
+
+    return report_data
+
+def get_activity_streak(user_id: str, today_timestamp: str) -> int:
+    """
+    Menghitung jumlah hari berturut-turut user menyelesaikan minimal 1 aktivitas.
+    Input today_timestamp: dd/mm/yyyy
+    """
+    try:
+        today_date = datetime.strptime(today_timestamp, "%d/%m/%Y")
+    except ValueError:
+        raise ValueError("Format tanggal tidak valid. Gunakan dd/mm/yyyy")
+
+    streak_count = 0
+    current_date = today_date
+
+    while True:
+        # Format ke bentuk DB (YYYY-MM-DD)
+        date_str_db = current_date.strftime("%Y-%m-%d")
+        
+        # Cari dokumen harian untuk tanggal yang sedang dicek
+        docs = (
+            db.collection(DAILY_ACT_COL)
+            .where(filter=FieldFilter("userID", "==", user_id))
+            .where(filter=FieldFilter("timestamp", "==", date_str_db))
+            .limit(1)
+            .stream()
+        )
+        
+        doc_found = None
+        for d in docs:
+            doc_found = d
+            break
+            
+        if not doc_found:
+            # Jika hari ini tidak ada dokumen, cek hari sebelumnya.
+            # Tapi jika dokumen yang hilang adalah kemarin atau sebelumnya, streak putus.
+            if current_date == today_date:
+                current_date -= timedelta(days=1)
+                continue
+            else:
+                break
+        
+        # Jika dokumen harian ada, cek apakah ada minimal 1 aktivitas yang 'done'
+        sub_docs = (
+            doc_found.reference.collection(ACT_SUB_COL)
+            .where(filter=FieldFilter("done", "==", True))
+            .limit(1) # Cukup cari 1 saja agar query cepat
+            .stream()
+        )
+        
+        has_done = False
+        for _ in sub_docs:
+            has_done = True
+            break
+            
+        if has_done:
+            # Ada aktivitas selesai, streak bertambah, lanjut cek hari sebelumnya
+            streak_count += 1
+            current_date -= timedelta(days=1)
+        else:
+            # Tidak ada yang selesai
+            if current_date == today_date:
+                # Wajar jika hari ini belum ada yang selesai, lanjut cek streak kemarin
+                current_date -= timedelta(days=1)
+            else:
+                # Jika hari kemarin tidak ada yang selesai, streak benar-benar putus
+                break
+                
+    return streak_count

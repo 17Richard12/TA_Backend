@@ -14,16 +14,21 @@ router = APIRouter(prefix="/users", tags=["Users"])
 def register(payload: RegisterSchema):
     return user_controller.register(payload)
 
-
 @router.post("/login", summary="Login user")
 def login(payload: LoginSchema):
     return user_controller.login(payload)
 
+@router.get("/", summary="Get all users")
+def get_all_users():
+    return user_controller.get_all_users()
+
+@router.get("/patients", summary="Get all users with role 'user' (untuk list pasien dokter)")
+def get_patients():
+    return user_controller.get_patients()
 
 @router.get("/{uid}", summary="Get user account")
 def get_user(uid: str):
     return user_controller.get_user(uid)
-
 
 @router.put("/{uid}/edit", summary="Edit account profile")
 def edit_account(uid: str, payload: EditAccountSchema):

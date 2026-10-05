@@ -12,6 +12,13 @@ def get_smoke(
 ):
     return smoke_controller.get_smoke(user_id, timestamp)
 
+@router.get("/report", summary="Get 7-day smoke count report untuk kebutuhan grafik")
+def get_smoke_report(
+    user_id: str = Query(...), 
+    timestamp: str = Query(..., description="Tanggal akhir report, Format: dd/mm/yyyy")
+):
+    return smoke_controller.get_smoke_report(user_id, timestamp)
+
 @router.post("/", summary="Post smoke count (Otomatis update jika data userID & timestamp sudah ada)")
 def post_smoke(payload: SmokeCountSchema):
     return smoke_controller.post_smoke(payload)
