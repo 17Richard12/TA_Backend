@@ -56,6 +56,14 @@ def search_journal(query: str, n_results: int = 2) -> str:
     if not results['documents'] or not results['documents'][0]:
         return "Tidak ditemukan referensi medis yang relevan di jurnal lokal."
     
+    docs = results['documents'][0]
+    metas = results['metadatas'][0] if results.get('metadatas') and results['metadatas'][0] else [{}] * len(docs)
+    
+    formatted_chunks = []
+    for doc, meta in zip(docs, metas):
+        source = meta.get("source", "Jurnal Medis") if isinstance(meta, dict) else "Jurnal Medis"
+        formatted_chunks.append(f"[Sumber Jurnal / Dokumen: {source}]\n{doc}")
+
     # Gabungkan hasil pencarian menjadi satu string konteks
-    context = "\n\n---\n\n".join(results['documents'][0])
+    context = "\n\n---\n\n".join(formatted_chunks)
     return f"REFERENSI JURNAL MEDIS:\n{context}"

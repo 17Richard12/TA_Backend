@@ -4,9 +4,11 @@ import uuid
 import google.generativeai as genai
 import os
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from fastapi import HTTPException
 from google.genai import types
+from google.adk.events import Event
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from config.firebase import db
 from schemas.chat_schema import PostChatSchema
@@ -86,20 +88,201 @@ def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: b
         return doc_id
 
 
+def _fetch_patient_context(user_uid: str) -> dict:
+    """
+    Membaca profil user (accounts), riwayat merokok 5 hari terakhir (smokeCount),
+    dan aktivitas yang telah diselesaikan (dailyActivities) dari Firestore.
+    """
+    # 1. Profil Pasien
+    profile_lines = []
+    try:
+        user_doc = db.collection("accounts").document(user_uid).get()
+        if user_doc.exists:
+            u_data = user_doc.to_dict() or {}
+            name = u_data.get("name") or "-"
+            gender = u_data.get("gender") or "-"
+            birth = u_data.get("birth") or "-"
+            blood = u_data.get("bloodType") or "-"
+            height = u_data.get("height") or "-"
+            weight = u_data.get("weight") or "-"
+            history = u_data.get("history") or "-"
+
+            profile_lines.append(f"- Nama: {name}")
+            profile_lines.append(f"- Jenis Kelamin: {gender}")
+            profile_lines.append(f"- Tanggal Lahir/Usia: {birth}")
+            profile_lines.append(f"- Golongan Darah: {blood}")
+            profile_lines.append(f"- Tinggi / Berat: {height} cm / {weight} kg")
+            profile_lines.append(f"- Riwayat Penyakit/Medis: {history}")
+        else:
+            profile_lines.append("- Profil pengguna belum diisi.")
+    except Exception as e:
+        profile_lines.append(f"- Gagal membaca profil: {e}")
+
+    patient_profile_str = "\n".join(profile_lines)
+
+    # 2. Riwayat Merokok 5 Hari Terakhir
+    smoke_lines = []
+    try:
+        smoke_docs = (
+            db.collection("smokeCount")
+            .where(filter=FieldFilter("userID", "==", user_uid))
+            .stream()
+        )
+        records = []
+        for doc in smoke_docs:
+            d = doc.to_dict()
+            ts = d.get("timestamp", "")
+            cnt = d.get("count", 0)
+            if ts:
+                records.append({"timestamp": ts, "count": cnt})
+
+        records.sort(key=lambda x: str(x["timestamp"]), reverse=True)
+        recent_smoke = records[:5]
+
+        if recent_smoke:
+            for rec in recent_smoke:
+                smoke_lines.append(f"- {rec['timestamp']}: {rec['count']} batang")
+        else:
+            smoke_lines.append("Tidak ada riwayat konsumsi rokok tercatat dalam 5 hari terakhir.")
+    except Exception as e:
+        smoke_lines.append(f"Gagal mengambil riwayat merokok: {e}")
+
+    smoke_history_str = "\n".join(smoke_lines)
+
+    # 3. Aktivitas Sehat yang Diselesaikan
+    activity_lines = []
+    try:
+        act_docs = (
+            db.collection("dailyActivities")
+            .where(filter=FieldFilter("userID", "==", user_uid))
+            .stream()
+        )
+        act_records = []
+        for doc in act_docs:
+            d = doc.to_dict()
+            ts = d.get("timestamp", "")
+            sub_docs = (
+                doc.reference.collection("activities")
+                .where(filter=FieldFilter("done", "==", True))
+                .stream()
+            )
+            for sub in sub_docs:
+                sd = sub.to_dict()
+                act_text = sd.get("activity", "")
+                if act_text:
+                    act_records.append({"timestamp": ts, "activity": act_text})
+
+        act_records.sort(key=lambda x: str(x["timestamp"]), reverse=True)
+        recent_acts = act_records[:5]
+        if recent_acts:
+            for a in recent_acts:
+                activity_lines.append(f"- {a['activity']} ({a['timestamp']})")
+        else:
+            activity_lines.append("Belum ada aktivitas sehat yang diselesaikan.")
+    except Exception as e:
+        activity_lines.append(f"Gagal mengambil aktivitas selesai: {e}")
+
+    completed_activities_str = "\n".join(activity_lines)
+
+    # 4. Gabungkan seluruh konteks
+    patient_context_str = (
+        f"=== PROFIL PASIEN ===\n{patient_profile_str}\n\n"
+        f"=== RIWAYAT MEROKOK (5 HARI TERAKHIR) ===\n{smoke_history_str}\n\n"
+        f"=== AKTIVITAS SEHAT YANG SELESAI ===\n{completed_activities_str}"
+    )
+
+    return {
+        "patient_context": patient_context_str,
+        "patient_profile": patient_profile_str,
+        "smoke_history": smoke_history_str,
+        "completed_activities": completed_activities_str,
+    }
+
+
+async def _get_or_restore_session(runner, user_uid: str, requested_session_id: Optional[str]) -> tuple[str, bool]:
+    """
+    Mendapatkan session yang aktif di memori runner, atau memulihkannya jika belum ada.
+    Return: (session_id, is_new_session)
+    """
+    patient_state = _fetch_patient_context(user_uid)
+
+    if not requested_session_id:
+        # Sesi baru sama sekali
+        session = await runner.session_service.create_session(
+            app_name="agent_doctor",
+            user_id=user_uid,
+            state=patient_state,
+        )
+        return session.id, True
+
+    # Jika requested_session_id diberikan, cek apakah sudah aktif di memori runner
+    session = await runner.session_service.get_session(
+        app_name="agent_doctor",
+        user_id=user_uid,
+        session_id=requested_session_id,
+    )
+
+    if session is not None:
+        # Sesi sudah ada di memori runner. Pastikan state di storage runner ter-update dengan konteks pasien terbaru
+        app_name = "agent_doctor"
+        if (
+            hasattr(runner.session_service, "sessions")
+            and app_name in runner.session_service.sessions
+            and user_uid in runner.session_service.sessions[app_name]
+            and requested_session_id in runner.session_service.sessions[app_name][user_uid]
+        ):
+            runner.session_service.sessions[app_name][user_uid][requested_session_id].state.update(patient_state)
+        return requested_session_id, False
+
+    # Sesi TIDAK ada di memori runner (misalnya setelah server restart atau sesi dibuka kembali)
+    session = await runner.session_service.create_session(
+        app_name="agent_doctor",
+        user_id=user_uid,
+        session_id=requested_session_id,
+        state=patient_state,
+    )
+
+    # Pulihkan riwayat pesan dari Firestore ke session memory
+    doc_id, _ = _find_session_doc(requested_session_id)
+    if doc_id:
+        msgs_stream = (
+            db.collection(CHATS_COL).document(doc_id)
+            .collection(MESSAGES_COL)
+            .order_by("timestamp")
+            .stream()
+        )
+        all_msgs = [m.to_dict() for m in msgs_stream]
+
+        # Ambil N pesan terakhir (20 pesan / 10 turn percakapan terakhir)
+        N = 20
+        recent_msgs = all_msgs[-N:] if len(all_msgs) > N else all_msgs
+
+        for msg in recent_msgs:
+            role = msg.get("role")
+            text = msg.get("response", "")
+            if not text:
+                continue
+            if role == "user":
+                event = Event(
+                    author="user",
+                    content=types.Content(role="user", parts=[types.Part(text=text)])
+                )
+                await runner.session_service.append_event(session, event)
+            elif role in ["ai", "assistant", "model"]:
+                event = Event(
+                    author="healthcare_coordinator",
+                    content=types.Content(role="model", parts=[types.Part(text=text)])
+                )
+                await runner.session_service.append_event(session, event)
+
+    return requested_session_id, False
+
+
 # ---------- service functions ----------
 
 async def post_chat(payload: PostChatSchema, runner) -> dict:
-    # 1. Tentukan session
-    if payload.session_id is None:
-        session = await runner.session_service.create_session(
-            app_name="agent_doctor",
-            user_id=payload.user_uid,
-        )
-        session_id = session.id
-        is_new_session = True
-    else:
-        session_id = payload.session_id
-        is_new_session = False
+    # 1. Tentukan session (ambil dari memori atau pulihkan dari Firestore)
+    session_id, is_new_session = await _get_or_restore_session(runner, payload.user_uid, payload.session_id)
 
     # 2. Jalankan agent
     content = types.Content(
@@ -142,17 +325,8 @@ async def post_chat(payload: PostChatSchema, runner) -> dict:
 
 
 async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, None]:
-    # 1. Tentukan session
-    if payload.session_id is None:
-        session = await runner.session_service.create_session(
-            app_name="agent_doctor",
-            user_id=payload.user_uid,
-        )
-        session_id = session.id
-        is_new_session = True
-    else:
-        session_id = payload.session_id
-        is_new_session = False
+    # 1. Tentukan session (ambil dari memori atau pulihkan dari Firestore)
+    session_id, is_new_session = await _get_or_restore_session(runner, payload.user_uid, payload.session_id)
 
     # 2. Kirim session_id ke client
     yield f"data: [SESSION]{session_id}\n\n"

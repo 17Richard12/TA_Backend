@@ -73,3 +73,17 @@ def get_patients():
         "status": "success",
         "data": sanitized_users
     }
+
+def get_patient_daily_report(uid: str, date_str: str):
+    try:
+        report = user_service.get_patient_daily_report(uid, date_str)
+        return {
+            "status": "success",
+            "message": "Berhasil mengambil laporan pasien",
+            "data": report
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }

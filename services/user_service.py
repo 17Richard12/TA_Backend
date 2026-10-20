@@ -121,3 +121,110 @@ def get_patients() -> list:
     for doc in docs:
         users.append({"uid": doc.id, **doc.to_dict()})
     return users
+
+def get_patient_daily_report(uid: str, date_str: str) -> dict:
+    """
+    Mengambil data lengkap pasien beserta laporan aktivitas dan rokok pada tanggal tertentu.
+    Format date_str: YYYY-MM-DD
+    """
+    # 1. Ambil Data Pasien
+    user = _get_user_by_uid(uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="Pasien tidak ditemukan")
+    
+    # Hapus field password agar aman dikirim ke frontend
+    user_data = {k: v for k, v in user.items() if k != "password"}
+
+    # 2. Ambil Total Smoke Count
+    smoke_query = (
+        db.collection("smokeCount")
+        .where(filter=FieldFilter("userID", "==", uid))
+        .where(filter=FieldFilter("timestamp", "==", date_str))
+        .limit(1)
+        .stream()
+    )
+    
+    total_smoke = 0
+    for doc in smoke_query:
+        total_smoke = doc.to_dict().get("count", 0)
+        break
+
+    # 3. Ambil Daily Activities (Update List Lengkap)
+    act_query = (
+        db.collection("dailyActivities")
+        .where(filter=FieldFilter("userID", "==", uid))
+        .where(filter=FieldFilter("timestamp", "==", date_str))
+        .limit(1)
+        .stream()
+    )
+    
+    activities_list = []
+    total_act = 0
+    total_act_done = 0
+    
+    for doc in act_query:
+        sub_docs = doc.reference.collection("activities").stream()
+        for sub in sub_docs:
+            sub_data = sub.to_dict()
+            is_done = sub_data.get("done", False)
+            
+            # Masukkan semua aktivitas (done atau belum) ke dalam list berupa objek
+            activities_list.append({
+                "id": sub.id,
+                "activity": sub_data.get("activity", "Aktivitas tidak bernama"),
+                "done": is_done
+            })
+            
+            total_act += 1
+            if is_done:
+                total_act_done += 1
+        break
+
+    return {
+        "report_date": date_str,
+        "patient_data": user_data,
+        "total_smoke": total_smoke,
+        "total_activity": total_act,
+        "total_activity_done": total_act_done,
+        "activities_list": activities_list
+    }
+
+def add_daily_activity(uid: str, date_str: str, activity_text: str) -> str:
+    parent_query = db.collection("dailyActivities").where(filter=FieldFilter("userID", "==", uid)).where(filter=FieldFilter("timestamp", "==", date_str)).limit(1).stream()
+    parent_doc = None
+    for doc in parent_query:
+        parent_doc = doc.reference
+        break
+    
+    # Jika dokumen parent untuk tanggal tersebut belum ada, buat baru
+    if not parent_doc:
+        _, parent_doc = db.collection("dailyActivities").add({
+            "userID": uid,
+            "timestamp": date_str
+        })
+    
+    new_act_ref = parent_doc.collection("activities").document()
+    new_act_ref.set({
+        "activity": activity_text,
+        "done": False,
+    })
+    return new_act_ref.id
+
+def edit_daily_activity(uid: str, date_str: str, activity_id: str, activity_text: str = None, done: bool = None):
+    parent_query = db.collection("dailyActivities").where(filter=FieldFilter("userID", "==", uid)).where(filter=FieldFilter("timestamp", "==", date_str)).limit(1).stream()
+    for doc in parent_query:
+        act_ref = doc.reference.collection("activities").document(activity_id)
+        updates = {}
+        if activity_text is not None:
+            updates["activity"] = activity_text
+        if done is not None:
+            updates["done"] = done
+        if updates:
+            act_ref.update(updates)
+        break
+
+def delete_daily_activity(uid: str, date_str: str, activity_id: str):
+    parent_query = db.collection("dailyActivities").where(filter=FieldFilter("userID", "==", uid)).where(filter=FieldFilter("timestamp", "==", date_str)).limit(1).stream()
+    for doc in parent_query:
+        doc.reference.collection("activities").document(activity_id).delete()
+        break

@@ -44,3 +44,8 @@ class UserResponse(BaseModel):
     weight: Optional[float] = None
     phone: Optional[str] = None
     history: Optional[str] = None
+
+class ActivityRequestSchema(BaseModel):
+    date: str                        # Format YYYY-MM-DD
+    activity: Optional[str] = None   # Nama aktivitas
+    done: Optional[bool] = None      # Status selesai/belum
