@@ -8,6 +8,7 @@ from schemas.xray_schema import PostXraySchema
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 XRAYS_COL = "xrays"
+genai.configure(api_key="AIzaSyD-UCOZbYMrpCjFlN3PZ7KCNUcfdTV75Fs")
 
 def background_analyze(doc_id: str, old_base64: str, new_base64: str):
     analysis_text = analyze_xray_with_gemini(old_base64, new_base64)
@@ -17,15 +18,16 @@ def background_analyze(doc_id: str, old_base64: str, new_base64: str):
     })
 
 def analyze_xray_with_gemini(old_base64: str, new_base64: str) -> str:
+
     try:
         model = genai.GenerativeModel('gemini-3.7-flash')
         old_data = old_base64.split(",")[-1] if "," in old_base64 else old_base64
         new_data = new_base64.split(",")[-1] if "," in new_base64 else new_base64
         
-        prompt = """Anda adalah asisten medis AI. Bandingkan dua gambar X-Ray ini. 
-        Gambar 1 adalah X-Ray sebelumnya (lama), dan Gambar 2 adalah X-Ray terbaru. 
-        Berikan penjelasan singkat (maksimal 3-4 kalimat) tentang perbedaan visual yang terlihat. 
-        Akhiri dengan disclaimer singkat bahwa pengguna harus tetap berkonsultasi dengan dokter sungguhan."""
+        prompt = """Anda adalah asisten medis AI. Bandingkan dua gambar X-Ray ini (Gambar 1: Lama, Gambar 2: Terbaru). 
+        Berikan analisis maksimal 2 kalimat yang HANYA FOKUS pada perubahan kondisi fisik paru-paru (misal: bercak, konsolidasi, atau kebersihan area paru). 
+        Abaikan perbedaan resolusi, kecerahan, ukuran, atau penanda digital pada gambar. 
+        Tutup dengan: '*Catatan: Ini bukan diagnosis medis. Harap konsultasikan dengan dokter.*'"""
         
         image_parts = [
             {"mime_type": "image/jpeg", "data": base64.b64decode(old_data)},
@@ -35,7 +37,7 @@ def analyze_xray_with_gemini(old_base64: str, new_base64: str) -> str:
         response = model.generate_content([prompt, image_parts[0], image_parts[1]])
         return response.text
     except Exception as e:
-        return f"Gagal menghasilkan analisis AI: {str(e)}"
+        return f"Gagal menghasilkan analisis: {str(e)}"
 
 def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:20]
@@ -60,7 +62,7 @@ def save_xray(payload: PostXraySchema, background_tasks: BackgroundTasks) -> dic
         "userID": payload.user_id,
         "foto": payload.foto_base64,
         "timestamp": datetime.datetime.now(datetime.timezone.utc),
-        "analysis_result": "Sedang dianalisis oleh AI Gemini... Silakan muat ulang (refresh) halaman beberapa saat lagi." 
+        "analysis_result": "Sedang dianalisis oleh Agent... Silakan muat ulang (refresh) halaman beberapa saat lagi." 
     }
     db.collection(XRAYS_COL).document(doc_id).set(data)
     
