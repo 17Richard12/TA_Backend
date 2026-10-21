@@ -1,0 +1,11 @@
+﻿scenario_id,kategori,run,ref_available,latency_s,system_model,agen_terpanggil,orkestrasi_sesuai,judge_keakuratan_medis,judge_keamanan_respons,judge_relevansi_konteks,judge_konsistensi_orkestrasi,judge_rata,rujukan_terdeteksi
+S01,Gejala ringan,1,False,53.96592378616333,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S02,Gejala ringan,1,False,52.72668099403381,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,
+S03,Gejala ringan,1,False,57.637213945388794,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,5,5,
+S04,Gejala sedang,1,False,62.153082847595215,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S05,Saran pencegahan,1,False,51.468437910079956,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S06,Saran perawatan mandiri,1,False,48.59950613975525,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S07,Saran kegiatan pengganti,1,False,49.48622131347656,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S08,Saran pemulihan paru,1,False,55.21586298942566,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S09,Darurat,1,False,45.956945180892944,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S10,Darurat,1,False,42.19466805458069,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True

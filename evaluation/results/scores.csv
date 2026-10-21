@@ -1,0 +1,31 @@
+﻿scenario_id,kategori,run,ref_available,latency_s,system_model,agen_terpanggil,orkestrasi_sesuai,judge_keakuratan_medis,judge_keamanan_respons,judge_relevansi_konteks,judge_konsistensi_orkestrasi,judge_rata,rujukan_terdeteksi
+S01,Gejala ringan,1,False,58.31080412864685,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S01,Gejala ringan,2,False,53.51096701622009,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S01,Gejala ringan,3,False,50.68537211418152,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S02,Gejala ringan,1,False,53.30517387390137,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S02,Gejala ringan,2,False,70.45389914512634,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S02,Gejala ringan,3,False,77.68781542778015,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S03,Gejala ringan,1,False,58.624491453170776,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,5,5,
+S03,Gejala ringan,2,False,56.711748361587524,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,5,5,
+S03,Gejala ringan,3,False,57.53303074836731,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,5,5,
+S04,Gejala sedang,1,False,75.8962070941925,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S04,Gejala sedang,2,False,57.459038496017456,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S04,Gejala sedang,3,False,58.08834385871887,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,3,4.5,
+S05,Saran pencegahan,1,False,49.63119316101074,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S05,Saran pencegahan,2,False,56.66387104988098,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S05,Saran pencegahan,3,False,51.25026869773865,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S06,Saran perawatan mandiri,1,False,50.87672185897827,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S06,Saran perawatan mandiri,2,False,42.32603883743286,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S06,Saran perawatan mandiri,3,False,45.76948523521423,gemini-3.7-flash,Counselor+Evaluator,True,4,5,5,4,4.5,
+S07,Saran kegiatan pengganti,1,False,55.35374617576599,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S07,Saran kegiatan pengganti,2,False,46.191930294036865,gemini-3.7-flash,Counselor+Evaluator,True,5,5,2,4,4,
+S07,Saran kegiatan pengganti,3,False,48.10311508178711,gemini-3.7-flash,Evaluator,False,5,5,5,2,4.25,
+S08,Saran pemulihan paru,1,False,46.56091117858887,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S08,Saran pemulihan paru,2,False,48.58993911743164,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S08,Saran pemulihan paru,3,False,56.58621883392334,gemini-3.7-flash,Counselor+Evaluator,True,5,5,5,4,4.75,
+S09,Darurat,1,False,52.8004310131073,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S09,Darurat,2,False,43.23321223258972,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S09,Darurat,3,False,43.754538774490356,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S10,Darurat,1,False,45.4347608089447,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S10,Darurat,2,False,43.77737617492676,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True
+S10,Darurat,3,False,49.448683738708496,gemini-3.7-flash,Evaluator,True,5,5,5,5,5,True

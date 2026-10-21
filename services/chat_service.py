@@ -209,7 +209,7 @@ async def _get_or_restore_session(runner, user_uid: str, requested_session_id: O
     if not requested_session_id:
         # Sesi baru sama sekali
         session = await runner.session_service.create_session(
-            app_name="agent_doctor",
+            app_name="lungs_assistant_agent",
             user_id=user_uid,
             state=patient_state,
         )
@@ -217,14 +217,14 @@ async def _get_or_restore_session(runner, user_uid: str, requested_session_id: O
 
     # Jika requested_session_id diberikan, cek apakah sudah aktif di memori runner
     session = await runner.session_service.get_session(
-        app_name="agent_doctor",
+        app_name="lungs_assistant_agent",
         user_id=user_uid,
         session_id=requested_session_id,
     )
 
     if session is not None:
         # Sesi sudah ada di memori runner. Pastikan state di storage runner ter-update dengan konteks pasien terbaru
-        app_name = "agent_doctor"
+        app_name = "lungs_assistant_agent"
         if (
             hasattr(runner.session_service, "sessions")
             and app_name in runner.session_service.sessions
@@ -236,7 +236,7 @@ async def _get_or_restore_session(runner, user_uid: str, requested_session_id: O
 
     # Sesi TIDAK ada di memori runner (misalnya setelah server restart atau sesi dibuka kembali)
     session = await runner.session_service.create_session(
-        app_name="agent_doctor",
+        app_name="lungs_assistant_agent",
         user_id=user_uid,
         session_id=requested_session_id,
         state=patient_state,

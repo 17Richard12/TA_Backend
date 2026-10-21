@@ -1,0 +1,5 @@
+rouge-score
+pandas
+python-docx
+python-dotenv
+google-genai

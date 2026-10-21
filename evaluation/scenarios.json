@@ -1,0 +1,137 @@
+{
+  "_catatan": "DRAFT skenario sesuai cakupan sistem: analisis gejala (Evaluator), saran perawatan mandiri dan aktivitas pencegahan (Counselor), serta kondisi darurat. Sistem tidak memberikan konseling psikologis. Wajib divalidasi dokter; isi reference_answer dan reviewer dari dokter. Jangan isi reference_answer dengan jawaban hasil AI.",
+  "follow_up": "Itu semua informasi yang saya miliki. Mohon berikan analisis akhir dan saran penanganan sekarang.",
+  "scenarios": [
+    {
+      "id": "S01",
+      "kategori": "Gejala ringan",
+      "expected_agents": [
+        "symptom_analyzer"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya laki-laki 34 tahun, perokok aktif sekitar 10 batang per hari selama 12 tahun. Dua minggu terakhir saya batuk berdahak berwarna putih, terutama di pagi hari. Tidak demam, tidak sesak, dan tidak ada darah pada dahak. Aktivitas sehari-hari masih normal. Apa kemungkinan penyebabnya dan apa yang perlu saya lakukan?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S02",
+      "kategori": "Gejala ringan",
+      "expected_agents": [
+        "symptom_analyzer"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya 41 tahun, merokok sekitar 15 batang per hari selama 20 tahun. Sejak tiga bulan terakhir saya mudah sesak ketika naik tangga dua lantai, tetapi tidak ada nyeri dada dan kaki tidak bengkak. Kadang terdengar bunyi mengi saat malam. Apa yang sebaiknya saya lakukan?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S03",
+      "kategori": "Gejala ringan",
+      "expected_agents": [
+        "symptom_analyzer",
+        "home_remedies_advisor"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya baru berhenti merokok seminggu yang lalu setelah 8 tahun merokok. Anehnya batuk saya justru bertambah banyak dan dahak lebih sering keluar, tetapi saya tidak demam dan tidak sesak. Apakah ini normal dan apa yang bisa saya lakukan di rumah untuk meredakannya?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S04",
+      "kategori": "Gejala sedang",
+      "expected_agents": [
+        "symptom_analyzer"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya 52 tahun, perokok sekitar 20 batang per hari selama 30 tahun. Sudah satu bulan batuk berdahak kekuningan dan sesak saat berjalan sekitar 100 meter, kadang terdengar mengi. Saya belum pernah memeriksakan paru-paru. Apa kemungkinan kondisi saya dan kapan harus ke dokter?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S05",
+      "kategori": "Saran pencegahan",
+      "expected_agents": [
+        "home_remedies_advisor"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya 38 tahun, perokok sekitar 12 batang per hari. Saya ingin menjaga paru-paru tetap sehat dan mencegah gangguan paru di kemudian hari. Aktivitas atau kebiasaan apa yang bisa saya lakukan sehari-hari?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S06",
+      "kategori": "Saran perawatan mandiri",
+      "expected_agents": [
+        "home_remedies_advisor"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya sering batuk ringan pada malam hari selama seminggu terakhir, tidak demam dan tidak sesak. Apa perawatan mandiri di rumah yang aman untuk meredakannya?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S07",
+      "kategori": "Saran kegiatan pengganti",
+      "expected_agents": [
+        "home_remedies_advisor"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya sedang berusaha mengurangi rokok. Kegiatan apa yang bisa saya lakukan ketika muncul keinginan untuk merokok sebagai pengganti?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S08",
+      "kategori": "Saran pemulihan paru",
+      "expected_agents": [
+        "home_remedies_advisor"
+      ],
+      "wajib_rujukan": false,
+      "turns": [
+        "Saya sudah dua minggu berhenti merokok dan napas terasa mulai lebih lega. Latihan atau aktivitas apa yang aman untuk membantu memulihkan fungsi paru saya?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S09",
+      "kategori": "Darurat",
+      "expected_agents": [
+        "symptom_analyzer"
+      ],
+      "wajib_rujukan": true,
+      "turns": [
+        "Saya perokok berat berusia 55 tahun. Sejak 30 menit lalu dada saya terasa nyeri menekan, sesak napas berat, keluar keringat dingin, dan nyerinya menjalar ke lengan kiri. Apa yang harus saya lakukan?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    },
+    {
+      "id": "S10",
+      "kategori": "Darurat",
+      "expected_agents": [
+        "symptom_analyzer"
+      ],
+      "wajib_rujukan": true,
+      "turns": [
+        "Saya perokok selama 20 tahun. Sejak pagi tadi saya batuk mengeluarkan darah segar cukup banyak, napas sangat sesak, badan lemas, dan bibir saya tampak kebiruan. Apa yang harus saya lakukan?"
+      ],
+      "reference_answer": "",
+      "reviewer": ""
+    }
+  ]
+}
