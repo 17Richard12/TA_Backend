@@ -2,6 +2,10 @@ from config.firebase import db
 from google.cloud.firestore_v1.base_query import FieldFilter
 from datetime import datetime, timezone, timedelta
 
+SMOKES_COL = "smokeCount" 
+ACTIVITIES_COL = "dailyActivities"
+CHATS_COL = "chats"
+
 def get_dashboard_report(user_id: str, date_str: str) -> dict:
     """
     date_str: format 'YYYY-MM-DD'
@@ -74,3 +78,95 @@ def get_dashboard_report(user_id: str, date_str: str) -> dict:
         "smoke_hourly_graph": smoke_hourly_graph,
         "activities_done_list": activities_done_list
     }
+
+def get_monthly_report(user_id: str, year: int, month: int) -> dict:
+    try:
+        # Tentukan rentang waktu: awal bulan ini sampai awal bulan depan
+        start_date = datetime(year, month, 1, tzinfo=timezone.utc)
+        
+        if month == 12:
+            end_date = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            end_date = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+
+        available_dates = set()
+        total_smoke = 0
+        total_activities = 0
+        total_chats = 0
+
+        # 1. Hitung Aktivitas Harian
+        activities = db.collection(ACTIVITIES_COL).where(filter=FieldFilter("userID", "==", user_id)).stream()
+        for doc in activities:
+            data = doc.to_dict()
+            ts = data.get("timestamp")
+            
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except ValueError:
+                    pass 
+            
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                    
+                if start_date <= ts < end_date:
+                    total_activities += 1
+                    available_dates.add(ts.strftime("%Y-%m-%d"))
+
+        # 2. Hitung Rokok
+        smokes = db.collection(SMOKES_COL).where(filter=FieldFilter("userID", "==", user_id)).stream()
+        for doc in smokes:
+            data = doc.to_dict()
+            ts = data.get("timestamp")
+            
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
+            
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                    
+                if start_date <= ts < end_date:
+                    total_smoke += data.get("count", 1) 
+                    available_dates.add(ts.strftime("%Y-%m-%d"))
+
+        # 3. Hitung Chat
+        chats = db.collection(CHATS_COL).where(filter=FieldFilter("userID", "==", user_id)).stream()
+        for doc in chats:
+            data = doc.to_dict()
+            ts = data.get("timestamp")
+            
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
+            
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                    
+                if start_date <= ts < end_date:
+                    total_chats += 1
+                    available_dates.add(ts.strftime("%Y-%m-%d"))
+
+        return {
+            "status": "success",
+            "data": {
+                "year": year,
+                "month": month,
+                "total_smoke_count": total_smoke,
+                "total_activities": total_activities,
+                "total_chats": total_chats,
+                "available_dates": sorted(list(available_dates)) 
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }

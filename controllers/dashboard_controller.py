@@ -1,5 +1,6 @@
 from schemas.dashboard_schema import DashboardResponse
-from services.dashboard_service import get_dashboard_report
+# 1. Tambahkan 'as service_get_monthly_report' agar namanya tidak bentrok
+from services.dashboard_service import get_dashboard_report, get_monthly_report as service_get_monthly_report
 from datetime import datetime
 
 def get_dashboard(user_id: str, date: str) -> DashboardResponse:
@@ -21,3 +22,8 @@ def get_dashboard(user_id: str, date: str) -> DashboardResponse:
         import traceback
         traceback.print_exc()
         raise e
+
+def get_monthly_report(user_id: str, year: int, month: int):
+    # 2. Panggil fungsi menggunakan nama aliasnya (TANPA tanda titik di tengahnya)
+    result = service_get_monthly_report(user_id, year, month)
+    return result

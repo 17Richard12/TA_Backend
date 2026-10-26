@@ -15,7 +15,7 @@ genai.configure(api_key="AIzaSyD-UCOZbYMrpCjFlN3PZ7KCNUcfdTV75Fs")
 def analyze_mri_with_gemini(old_base64: str, new_base64: str) -> str:
     try:
         # Menggunakan versi model yang valid
-        model = genai.GenerativeModel('gemini-3.7-flash') 
+        model = genai.GenerativeModel('gemini-3.7`-flash') 
         old_data = old_base64.split(",")[-1] if "," in old_base64 else old_base64
         new_data = new_base64.split(",")[-1] if "," in new_base64 else new_base64
         
