@@ -1,3 +1,4 @@
+import os
 import uuid
 import datetime
 import base64
@@ -8,7 +9,7 @@ from schemas.xray_schema import PostXraySchema
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 XRAYS_COL = "xrays"
-genai.configure(api_key="AIzaSyD-UCOZbYMrpCjFlN3PZ7KCNUcfdTV75Fs")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 def background_analyze(doc_id: str, old_base64: str, new_base64: str):
     analysis_text = analyze_xray_with_gemini(old_base64, new_base64)
