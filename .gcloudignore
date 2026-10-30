@@ -1,0 +1,13 @@
+#!include:.gitignore
+.git
+.DS_Store
+**/.DS_Store
+.env
+.env.*
+*serviceAccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+*credentials*.json
+evaluation/
+chroma_db/
+data/*.pdf

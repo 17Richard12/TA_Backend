@@ -1,5 +1,7 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from routers.xray_router import router as xray_router
 from routers.user_router import router as user_router
 from routers.chat_router import router as chat_router
@@ -37,3 +39,9 @@ app.include_router(xray_router, prefix="/api")
 @app.get("/", tags=["Health"])
 def health_check():
     return {"status": "ok", "message": "Server is running"}
+
+if __name__ == "__main__":
+    # Mengambil port dari environment variable (default ke 8080 jika tidak ada)
+    port = int(os.environ.get("PORT", 8080))
+    # Wajib menggunakan host 0.0.0.0 untuk Cloud Run
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

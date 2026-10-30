@@ -1,0 +1,14 @@
+# Mengunci versi supaya hasil deploy sama dengan environment lokal-mu.
+# Penting: ChromaDB harus 0.5.23 karena data/vector_db dibuat dengan versi ini
+# (format penyimpanan dapat berubah antar versi mayor).
+fastapi==0.119.1
+uvicorn==0.52.0
+google-adk
+google-genai==1.40.0
+chromadb==1.5.9
+pydantic==2.11.7
+
+# TODO: tambahkan versi paket berikut dari `pip freeze` di environment backend-mu
+# (tidak muncul di `pip list` tadi): firebase-admin==X.Y.Z  dan  PyPDF2==X.Y.Z
+firebase_admin
+PyPDF2==3.0.1

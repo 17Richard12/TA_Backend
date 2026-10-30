@@ -1,3 +1,4 @@
+import os
 import uuid
 import datetime
 import base64
@@ -10,7 +11,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 PHOTOS_COL = "photos"
 
 # Pastikan API Key diisi, atau gunakan environment variable
-genai.configure(api_key="AIzaSyD-UCOZbYMrpCjFlN3PZ7KCNUcfdTV75Fs")  
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))  
 
 def analyze_mri_with_gemini(old_base64: str, new_base64: str) -> str:
     try:
@@ -20,7 +21,7 @@ def analyze_mri_with_gemini(old_base64: str, new_base64: str) -> str:
         new_data = new_base64.split(",")[-1] if "," in new_base64 else new_base64
         
         # PROMPT DIREVISI: Lebih pendek, tegas, dan fokus pada kondisi medis
-        prompt = """Anda adalah asisten medis AI. Bandingkan dua gambar MRI ini (Gambar 1: Lama, Gambar 2: Terbaru). 
+        prompt = """Anda adalah asisten medis AI. Bandingkan dua gambar CT Scan ini (Gambar 1: Lama, Gambar 2: Terbaru). 
         Berikan analisis maksimal 2 kalimat yang HANYA FOKUS pada perubahan kondisi fisik jaringan/organ yang terlihat (misal: massa, lesi, atau kelainan). 
         Abaikan perbedaan resolusi, kecerahan, ukuran, atau penanda digital pada gambar. 
         Tutup dengan: '*Catatan: Ini bukan diagnosis medis. Harap konsultasikan dengan dokter.*'"""
@@ -31,14 +32,14 @@ def analyze_mri_with_gemini(old_base64: str, new_base64: str) -> str:
         ]
         
         response = model.generate_content([prompt, image_parts[0], image_parts[1]])
-        return response.text
+        return response.text 
     except Exception as e:
         return f"Gagal menghasilkan analisis : {str(e)}"
 
 # FUNGSI BARU: Untuk menjalankan analisis Gemini di latar belakang
 def background_analyze_mri(doc_id: str, old_base64: str, new_base64: str):
     analysis_text = analyze_mri_with_gemini(old_base64, new_base64)
-    # Update dokumen MRI di Firestore setelah Gemini selesai berpikir
+    # Update dokumen CT Scan di Firestore setelah Gemini selesai berpikir
     db.collection(PHOTOS_COL).document(doc_id).update({
         "analysis_result": analysis_text
     })
@@ -62,7 +63,7 @@ def save_photo(payload: PostPhotoSchema, background_tasks: BackgroundTasks) -> d
     
     doc_id = _new_id()
     
-    # Simpan data MRI DENGAN status sementara
+    # Simpan data CT Scan DENGAN status sementara
     data = {
         "userID": payload.user_id,
         "foto": payload.foto_base64,
@@ -80,7 +81,7 @@ def save_photo(payload: PostPhotoSchema, background_tasks: BackgroundTasks) -> d
     return {
         "id": doc_id,
         "action": "inserted",
-        "message": "Foto MRI berhasil diupload. Analisis AI sedang berjalan."
+        "message": "Foto CT Scan berhasil diupload. Analisis AI sedang berjalan."
     }
 
 def get_latest_two_photos(user_id: str) -> dict:
@@ -120,9 +121,9 @@ def get_latest_two_photos(user_id: str) -> dict:
             
         analysis_text = ""
         if len(photos_raw) > 0:
-            analysis_text = photos_raw[0].get("analysis_result", "Upload satu gambar MRI lagi untuk melihat perbandingan dan analisis AI.")
+            analysis_text = photos_raw[0].get("analysis_result", "Upload satu gambar CT Scan lagi untuk melihat perbandingan dan analisis AI.")
         else:
-            analysis_text = "Belum ada data MRI yang diupload."
+            analysis_text = "Belum ada data CT Scan yang diupload."
             
         return {
             "status": "success",

@@ -1,0 +1,23 @@
+.git
+.gitignore
+.DS_Store
+**/.DS_Store
+__pycache__/
+**/__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+chroma_db/
+.env.*
+
+# Rahasia: jangan pernah masuk ke image
+*serviceAccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+*credentials*.json
+
+# Tidak dibutuhkan saat runtime
+evaluation/
+deploy.sh
+data/*.pdf

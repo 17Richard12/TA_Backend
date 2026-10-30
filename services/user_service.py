@@ -4,6 +4,7 @@ from fastapi import HTTPException
 import hashlib
 import uuid
 from google.cloud.firestore_v1 import FieldFilter
+from datetime import timedelta
 
 
 ACCOUNTS_COL = "accounts"
@@ -135,21 +136,54 @@ def get_patient_daily_report(uid: str, date_str: str) -> dict:
     # Hapus field password agar aman dikirim ke frontend
     user_data = {k: v for k, v in user.items() if k != "password"}
 
-    # 2. Ambil Total Smoke Count
-    smoke_query = (
+    # 2. Ambil Total Smoke Count + Hourly Graph
+    smoke_hourly_dict = {f"{i:02d}:00": 0 for i in range(24)}
+
+    smoke_docs = list(
         db.collection("smokeCount")
         .where(filter=FieldFilter("userID", "==", uid))
         .where(filter=FieldFilter("timestamp", "==", date_str))
         .limit(1)
         .stream()
     )
-    
-    total_smoke = 0
-    for doc in smoke_query:
-        total_smoke = doc.to_dict().get("count", 0)
-        break
 
-    # 3. Ambil Daily Activities (Update List Lengkap)
+    total_smoke = 0
+    if smoke_docs:
+        smoke_doc = smoke_docs[0]
+        total_smoke = smoke_doc.to_dict().get("count", 0)
+
+        # Ambil subcollection logs untuk grafik per jam
+        logs = smoke_doc.reference.collection("logs").stream()
+        for log in logs:
+            log_data = log.to_dict()
+            
+            # Cek properti logdate atau timestamp untuk fleksibilitas
+            logdate = log_data.get("logdate") or log_data.get("timestamp")
+            
+            if logdate:
+                try:
+                    # Parsing data jika Flutter mengirimkan Date String (ISO 8601)
+                    if isinstance(logdate, str):
+                        # Handle 'Z' suffix yang sering dikirim oleh Dart toIso8601String()
+                        parsed_date = datetime.fromisoformat(logdate.replace('Z', '+00:00'))
+                    else:
+                        # Asumsi objek sudah berupa Firestore Datetime / Python datetime
+                        parsed_date = logdate
+
+                    # Konversi ke waktu lokal UTC+7
+                    local_time = parsed_date + timedelta(hours=7)
+                    key = f"{local_time.hour:02d}:00"
+                    
+                    if key in smoke_hourly_dict:
+                        smoke_hourly_dict[key] += 1
+
+                except Exception as e:
+                    # Munculkan error di terminal untuk keperluan debugging (jangan di-pass saja)
+                    print(f"[DEBUG] Error parsing logdate '{logdate}' untuk user {uid}: {e}")
+
+    smoke_hourly_graph = [{"hour": k, "count": v} for k, v in smoke_hourly_dict.items()]
+
+    # 3. Ambil Daily Activities
     act_query = (
         db.collection("dailyActivities")
         .where(filter=FieldFilter("userID", "==", uid))
@@ -168,7 +202,6 @@ def get_patient_daily_report(uid: str, date_str: str) -> dict:
             sub_data = sub.to_dict()
             is_done = sub_data.get("done", False)
             
-            # Masukkan semua aktivitas (done atau belum) ke dalam list berupa objek
             activities_list.append({
                 "id": sub.id,
                 "activity": sub_data.get("activity", "Aktivitas tidak bernama"),
@@ -186,7 +219,8 @@ def get_patient_daily_report(uid: str, date_str: str) -> dict:
         "total_smoke": total_smoke,
         "total_activity": total_act,
         "total_activity_done": total_act_done,
-        "activities_list": activities_list
+        "activities_list": activities_list,
+        "smoke_hourly_graph": smoke_hourly_graph,
     }
 
 def add_daily_activity(uid: str, date_str: str, activity_text: str) -> str:
