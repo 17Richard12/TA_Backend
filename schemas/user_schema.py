@@ -1,13 +1,27 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
 from datetime import date
+import re
 
 
 class RegisterSchema(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
+    name: str
     email: EmailStr
-    password: str = Field(..., min_length=6)
+    password: str
     role: str = "user"
+
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password minimal 8 karakter.')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password harus mengandung huruf besar.')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password harus mengandung huruf kecil.')
+        if not re.search(r'\d', v):
+            raise ValueError('Password harus mengandung angka.')
+        return v
 
 
 
@@ -49,3 +63,13 @@ class ActivityRequestSchema(BaseModel):
     date: str                        # Format YYYY-MM-DD
     activity: Optional[str] = None   # Nama aktivitas
     done: Optional[bool] = None      # Status selesai/belum
+
+class OnboardingPayload(BaseModel):
+    birth: Optional[str] = None
+    bloodType: Optional[str] = None
+    gender: Optional[str] = None
+    height: Optional[float] = 0.0
+    weight: Optional[float] = 0.0
+    phone: Optional[str] = None
+    history: Optional[str] = None
+    initial_smoke_count: int = 0

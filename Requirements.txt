@@ -4,7 +4,7 @@ firebase-admin
 pydantic[email]
 python-dotenv
 google-adk
-google-cloud-storage<3.0.0
+google-cloud-storage
 google-generativeai
 google-genai
 chromadb==1.5.9

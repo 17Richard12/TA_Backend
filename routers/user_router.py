@@ -6,6 +6,7 @@ from schemas.user_schema import (
     LoginSchema,
     EditAccountSchema,
     ChangePasswordSchema,
+    OnboardingPayload,
 )
 from controllers import user_controller
 from services import user_service
@@ -73,4 +74,8 @@ def delete_activity(uid: str, activity_id: str, date: str):
         return {"status": "success", "message": "Berhasil dihapus"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@router.post("/{uid}/onboarding")
+def submit_onboarding(uid: str, payload: OnboardingPayload):
+    return user_controller.submit_onboarding(uid, payload)
     

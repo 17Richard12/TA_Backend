@@ -19,6 +19,17 @@ MESSAGES_COL = "messages"
 
 # ---------- helpers ----------
 
+EMERGENCY_KEYWORDS = [
+    "sesak", "sulit bernapas", "napas pendek", "batuk darah", 
+    "nyeri dada", "sakit dada", "pingsan", "darurat", "tolong", 
+    "sekarat", "henti napas", "tersedak parah"
+]
+
+def check_emergency(user_message: str) -> bool:
+    """Cek apakah pesan pengguna mengandung kata kunci darurat medis."""
+    msg = user_message.lower()
+    return any(keyword in msg for keyword in EMERGENCY_KEYWORDS)
+
 def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:20]
 
@@ -92,6 +103,7 @@ def _fetch_patient_context(user_uid: str) -> dict:
     """
     Membaca profil user (accounts), riwayat merokok 5 hari terakhir (smokeCount),
     dan aktivitas yang telah diselesaikan (dailyActivities) dari Firestore.
+    *Nama pasien disamarkan untuk menjaga privasi data medis.*
     """
     # 1. Profil Pasien
     profile_lines = []
@@ -99,7 +111,7 @@ def _fetch_patient_context(user_uid: str) -> dict:
         user_doc = db.collection("accounts").document(user_uid).get()
         if user_doc.exists:
             u_data = user_doc.to_dict() or {}
-            name = u_data.get("name") or "-"
+            # Field "name" sengaja tidak diambil untuk privasi
             gender = u_data.get("gender") or "-"
             birth = u_data.get("birth") or "-"
             blood = u_data.get("bloodType") or "-"
@@ -107,7 +119,8 @@ def _fetch_patient_context(user_uid: str) -> dict:
             weight = u_data.get("weight") or "-"
             history = u_data.get("history") or "-"
 
-            profile_lines.append(f"- Nama: {name}")
+            # Ganti nama dengan identitas anonim
+            profile_lines.append("- Nama: [DISAMARKAN UNTUK PRIVASI]")
             profile_lines.append(f"- Jenis Kelamin: {gender}")
             profile_lines.append(f"- Tanggal Lahir/Usia: {birth}")
             profile_lines.append(f"- Golongan Darah: {blood}")
@@ -284,7 +297,25 @@ async def post_chat(payload: PostChatSchema, runner) -> dict:
     # 1. Tentukan session (ambil dari memori atau pulihkan dari Firestore)
     session_id, is_new_session = await _get_or_restore_session(runner, payload.user_uid, payload.session_id)
 
-    # 2. Jalankan agent
+    # --- TRIAGE DARURAT (Bypass Agen LLM) ---
+    if check_emergency(payload.message):
+        emergency_reply = "⚠️ PERINGATAN DARURAT: Keluhan Anda mengindikasikan kondisi kritis. Segera hentikan aktivitas dan segera kunjungi UGD Rumah Sakit terdekat!"
+        
+        # Simpan pesan ke Firestore
+        doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session, payload.message)
+        _save_message(doc_id, "user", payload.message)
+        _save_message(doc_id, "ai", emergency_reply)
+        
+        return {
+            "session_id": session_id,
+            "user_message": payload.message,
+            "ai_response": emergency_reply,
+            "is_emergency": True,
+            "suggested_action": "open_hospital_map"
+        }
+    # ----------------------------------------
+
+    # 2. Jalankan agent (Hanya untuk non-darurat)
     content = types.Content(
         role="user",
         parts=[types.Part(text=payload.message)]
@@ -321,6 +352,7 @@ async def post_chat(payload: PostChatSchema, runner) -> dict:
         "session_id": session_id,
         "user_message": payload.message,
         "ai_response": final_response,
+        "is_emergency": False
     }
 
 
@@ -331,7 +363,28 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
     # 2. Kirim session_id ke client
     yield f"data: [SESSION]{session_id}\n\n"
 
-    # 3. Stream token dari agent
+    # --- TRIAGE DARURAT STREAMING (Bypass Agen LLM) ---
+    if check_emergency(payload.message):
+        emergency_reply = "⚠️ PERINGATAN DARURAT: Keluhan Anda mengindikasikan kondisi kritis. Segera hentikan aktivitas dan segera kunjungi UGD Rumah Sakit terdekat!"
+        
+        # Stream respons darurat secara instan
+        words = emergency_reply.split(" ")
+        for i, word in enumerate(words):
+            spaced_word = word + (" " if i < len(words) - 1 else "")
+            yield f"data: {json.dumps(spaced_word)}\n\n"
+            await asyncio.sleep(0.01) # Kecepatan tinggi (10ms)
+            
+        doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session, payload.message)
+        _save_message(doc_id, "user", payload.message)
+        _save_message(doc_id, "ai", emergency_reply)
+        
+        # Kirim sinyal khusus ke Flutter (Bisa dipakai untuk memunculkan map otomatis)
+        yield f"data: [EMERGENCY_ACTION]open_hospital_map\n\n"
+        yield f"data: [DONE]\n\n"
+        return
+    # --------------------------------------------------
+
+    # 3. Stream token dari agent (Hanya untuk non-darurat)
     content = types.Content(
         role="user",
         parts=[types.Part(text=payload.message)]
@@ -344,28 +397,20 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
             session_id=session_id,
             new_message=content,
         ):
-            # Ambil bagian teks dari event apa pun (final atau non-final)
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     text_chunk = part.text
                     
-                    # Pastikan teks tidak kosong dan belum pernah dikirim (mencegah duplikasi di event final)
                     if text_chunk and text_chunk not in full_response:
                         full_response += text_chunk
                         
-                        # TOKEN SIMULATOR: 
-                        # Jika teks yang diterima sangat besar (ciri khas hasil Tool Call RAG)
                         if len(text_chunk) > 30:
-                            # Pecah menjadi kata per kata
                             words = text_chunk.split(" ")
                             for i, word in enumerate(words):
-                                # Kembalikan spasi yang hilang
                                 spaced_word = word + (" " if i < len(words) - 1 else "")
                                 yield f"data: {json.dumps(spaced_word)}\n\n"
-                                # Jeda buatan 20 milidetik per kata agar natural
                                 await asyncio.sleep(0.02) 
                         else:
-                            # Jika LLM memang mengirim token kecil secara natural, langsung yield
                             yield f"data: {json.dumps(text_chunk)}\n\n"
                             await asyncio.sleep(0.01)
 
@@ -377,7 +422,7 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
         full_response = "Agent tidak memberikan respons."
         yield f"data: {json.dumps(full_response)}\n\n"
 
-    # 4. Simpan ke Firestore (subcollection messages)
+    # 4. Simpan ke Firestore
     doc_id = _get_or_create_session_doc(session_id, payload.user_uid, is_new_session, payload.message)
     _save_message(doc_id, "user", payload.message)
     _save_message(doc_id, "ai", full_response)

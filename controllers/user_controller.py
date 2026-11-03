@@ -4,6 +4,7 @@ from schemas.user_schema import (
     EditAccountSchema,
     ChangePasswordSchema,
     UserResponse,
+    OnboardingPayload,
 )
 from services import user_service
 
@@ -87,3 +88,17 @@ def get_patient_daily_report(uid: str, date_str: str):
             "status": "error",
             "message": str(e)
         }
+
+def submit_onboarding(uid: str, payload: OnboardingPayload):
+    try:
+        # Ubah payload Pydantic menjadi dictionary untuk diproses service
+        result = user_service.process_onboarding(uid, payload.dict())
+        
+        if result:
+            return {"status": "success", "message": "Data onboarding berhasil disimpan"}
+        else:
+            return {"status": "error", "message": "Gagal menyimpan data onboarding"}
+            
+    except Exception as e:
+        # Menangkap error dan mengembalikannya dengan format API yang bersih
+        return {"status": "error", "message": str(e)}

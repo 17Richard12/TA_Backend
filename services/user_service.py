@@ -4,7 +4,7 @@ from fastapi import HTTPException
 import hashlib
 import uuid
 from google.cloud.firestore_v1 import FieldFilter
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 
 ACCOUNTS_COL = "accounts"
@@ -262,3 +262,100 @@ def delete_daily_activity(uid: str, date_str: str, activity_id: str):
     for doc in parent_query:
         doc.reference.collection("activities").document(activity_id).delete()
         break
+
+import uuid
+from datetime import datetime, timezone
+from google.cloud.firestore_v1.base_query import FieldFilter
+
+def process_onboarding(uid: str, data: dict):
+    try:
+        # 1. Update profil pengguna (ke koleksi "accounts")
+        user_ref = db.collection(ACCOUNTS_COL).document(uid)
+        user_ref.set({
+            "birth": data.get("birth"),
+            "bloodType": data.get("bloodType"),
+            "gender": data.get("gender"),
+            "height": data.get("height"),
+            "weight": data.get("weight"),
+            "phone": data.get("phone"),
+            "history": data.get("history"),
+            "onboarding_completed": True
+        }, merge=True)
+
+        # 2. Inisialisasi Smoke Count & Logs
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        initial_smoke = int(data.get("initial_smoke_count", 0))
+        smoke_doc_id = f"{uid}_{today_str}"
+        
+        # Simpan nilai smoke count
+        db.collection("smokeCount").document(smoke_doc_id).set({
+            "userID": uid,
+            "count": initial_smoke,
+            "timestamp": today_str
+        }, merge=True)
+
+        # --- PERBAIKAN 1: BIKIN LOG ONBOARDING ---
+        # Jika ada jumlah rokok yang diinput, catat log agar terdeteksi di grafik
+        if initial_smoke > 0:
+            log_id = str(uuid.uuid4()).replace("-", "")[:20]
+            db.collection("smokeCount").document(smoke_doc_id).collection("logs").document(log_id).set({
+                "logdate": datetime.now(timezone.utc),
+                "action": "inserted_via_onboarding",
+                "amount": initial_smoke,
+                "previous_total": 0,
+                "new_total": initial_smoke
+            })
+
+        # --- PERBAIKAN 2: GENERATE MULTIPLE DAILY ACTIVITIES ---
+        # Siapkan array penampung. Aktivitas dasar yang selalu ada:
+        activities_to_add = [
+            "Minum air putih minimal 8 gelas hari ini",
+            "Lakukan peregangan tubuh ringan selama 10 menit"
+        ]
+
+        # RUMUS 1: Berdasarkan jumlah rokok awal
+        if initial_smoke > 10:
+            activities_to_add.append("Tarik napas dalam 4-7-8 setiap ada hasrat merokok")
+            activities_to_add.append("Ganti jadwal merokok dengan mengunyah permen karet")
+        elif initial_smoke > 0:
+            activities_to_add.append("Tunda merokok 10 menit jika hasrat muncul")
+
+        # RUMUS 2: Berdasarkan riwayat medis (history)
+        history = str(data.get("history", "")).lower()
+        if "asma" in history:
+            activities_to_add.append("Hindari debu dan pastikan inhaler mudah dijangkau")
+        elif "hipertensi" in history or "darah tinggi" in history:
+            activities_to_add.append("Kurangi konsumsi garam berlebih hari ini")
+
+        # Cari dokumen induk untuk Daily Activities hari ini
+        parent_query = (
+            db.collection("dailyActivities")
+            .where(filter=FieldFilter("userID", "==", uid))
+            .where(filter=FieldFilter("timestamp", "==", today_str))
+            .limit(1)
+            .stream()
+        )
+        
+        parent_doc = None
+        for doc in parent_query:
+            parent_doc = doc.reference
+            break
+        
+        # Jika belum ada parent dokumen untuk tanggal ini, buat baru
+        if not parent_doc:
+            _, parent_doc = db.collection("dailyActivities").add({
+                "userID": uid,
+                "timestamp": today_str
+            })
+        
+        # Looping untuk memasukkan SEMUA aktivitas dari rumus ke subkoleksi
+        for act_text in activities_to_add:
+            parent_doc.collection("activities").document().set({
+                "activity": act_text,
+                "done": False,
+            })
+
+        return True
+    except Exception as e:
+        print(f"Error in process_onboarding: {e}")
+        raise e
