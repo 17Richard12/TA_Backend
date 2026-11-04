@@ -20,9 +20,7 @@ MESSAGES_COL = "messages"
 # ---------- helpers ----------
 
 EMERGENCY_KEYWORDS = [
-    "sesak", "sulit bernapas", "napas pendek", "batuk darah", 
-    "nyeri dada", "sakit dada", "pingsan", "darurat", "tolong", 
-    "sekarat", "henti napas", "tersedak parah"
+    "batuk darah", "pingsan", "darurat", "tolong", "sekarat", "henti napas", "tersedak parah"
 ]
 
 def check_emergency(user_message: str) -> bool:
@@ -310,8 +308,7 @@ async def post_chat(payload: PostChatSchema, runner) -> dict:
             "session_id": session_id,
             "user_message": payload.message,
             "ai_response": emergency_reply,
-            "is_emergency": True,
-            "suggested_action": "open_hospital_map"
+            "is_emergency": True
         }
     # ----------------------------------------
 
@@ -379,7 +376,6 @@ async def stream_chat(payload: PostChatSchema, runner) -> AsyncGenerator[str, No
         _save_message(doc_id, "ai", emergency_reply)
         
         # Kirim sinyal khusus ke Flutter (Bisa dipakai untuk memunculkan map otomatis)
-        yield f"data: [EMERGENCY_ACTION]open_hospital_map\n\n"
         yield f"data: [DONE]\n\n"
         return
     # --------------------------------------------------
