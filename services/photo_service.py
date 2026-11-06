@@ -7,6 +7,7 @@ from fastapi import BackgroundTasks # <-- Tambahkan import ini
 from config.firebase import db
 from schemas.photo_schema import PostPhotoSchema
 from google.cloud.firestore_v1.base_query import FieldFilter
+from services.medical_image_validator import validate_medical_image
 
 PHOTOS_COL = "photos"
 
@@ -48,41 +49,76 @@ def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:20]
 
 # FUNGSI DIREVISI: Tambahkan parameter background_tasks
-def save_photo(payload: PostPhotoSchema, background_tasks: BackgroundTasks) -> dict:
-    docs = (
-        db.collection(PHOTOS_COL)
-        .where(filter=FieldFilter("userID", "==", payload.user_id))
-        .stream()
-    )
-    
-    photos_raw = [doc.to_dict() for doc in docs]
-    photos_raw.sort(
-        key=lambda x: x.get("timestamp") if x.get("timestamp") else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), 
-        reverse=True
-    )
-    
+def save_photo(payload: PostPhotoSchema, background_tasks: BackgroundTasks = None) -> dict:
+    # 0. Validasi pre-processing: tolak jika bukan gambar CT Scan / MRI (raise HTTP 422)
+    validate_medical_image(payload.foto_base64, accepted_modalities={"ct_scan", "mri"}, feature_label="CT Scan/MRI")
+
     doc_id = _new_id()
     
-    # Simpan data CT Scan DENGAN status sementara
+    # Simpan data CT Scan TANPA auto-analysis (analisis dijalankan manual via tombol "Start Analysis")
     data = {
         "userID": payload.user_id,
         "foto": payload.foto_base64,
         "timestamp": datetime.datetime.now(datetime.timezone.utc),
-        "analysis_result": "Sedang dianalisis oleh Agent... Silakan muat ulang (refresh) halaman beberapa saat lagi." 
+        "analysis_result": "" 
     }
     
     db.collection(PHOTOS_COL).document(doc_id).set(data)
     
-    # Lempar tugas Gemini ke Background Task agar upload langsung selesai
-    if len(photos_raw) > 0:
-        old_foto = photos_raw[0].get("foto", "")
-        background_tasks.add_task(background_analyze_mri, doc_id, old_foto, payload.foto_base64)
-    
     return {
         "id": doc_id,
         "action": "inserted",
-        "message": "Foto CT Scan berhasil diupload. Analisis AI sedang berjalan."
+        "message": "Foto CT Scan berhasil diupload. Tekan tombol 'Start Analysis' untuk memulai analisis AI."
     }
+
+
+def start_photo_analysis(user_id: str) -> dict:
+    """Menjalankan analisis AI secara manual berdasarkan 2 gambar CT Scan terbaru milik user."""
+    try:
+        docs = (
+            db.collection(PHOTOS_COL)
+            .where(filter=FieldFilter("userID", "==", user_id))
+            .stream()
+        )
+        photos_raw = []
+        for doc in docs:
+            d = doc.to_dict()
+            photos_raw.append({
+                "id": doc.id,
+                "foto": d.get("foto", ""),
+                "timestamp": d.get("timestamp"),
+            })
+        photos_raw.sort(
+            key=lambda x: x["timestamp"] if x["timestamp"] else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+            reverse=True
+        )
+
+        if len(photos_raw) < 2:
+            return {
+                "status": "error",
+                "message": "Dibutuhkan minimal 2 gambar CT Scan (Sebelumnya & Terbaru) untuk memulai analisis perbandingan."
+            }
+
+        newest = photos_raw[0]
+        older = photos_raw[1]
+        analysis_text = analyze_mri_with_gemini(older["foto"], newest["foto"])
+
+        db.collection(PHOTOS_COL).document(newest["id"]).update({
+            "analysis_result": analysis_text
+        })
+
+        return {
+            "status": "success",
+            "data": {
+                "id": newest["id"],
+                "analysis": analysis_text
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 def get_latest_two_photos(user_id: str) -> dict:
     try:

@@ -7,6 +7,7 @@ import google.generativeai as genai
 from config.firebase import db
 from schemas.xray_schema import PostXraySchema
 from google.cloud.firestore_v1.base_query import FieldFilter
+from services.medical_image_validator import validate_medical_image
 
 XRAYS_COL = "xrays"
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -43,40 +44,75 @@ def analyze_xray_with_gemini(old_base64: str, new_base64: str) -> str:
 def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:20]
 
-def save_xray(payload: PostXraySchema, background_tasks: BackgroundTasks) -> dict:
-    docs = (
-        db.collection(XRAYS_COL)
-        .where(filter=FieldFilter("userID", "==", payload.user_id))
-        .stream()
-    )
-    
-    xrays_raw = [doc.to_dict() for doc in docs]
-    xrays_raw.sort(
-        key=lambda x: x.get("timestamp") if x.get("timestamp") else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), 
-        reverse=True
-    )
-    
+def save_xray(payload: PostXraySchema, background_tasks: BackgroundTasks = None) -> dict:
+    # 0. Validasi pre-processing: tolak jika bukan gambar X-Ray (raise HTTP 422)
+    validate_medical_image(payload.foto_base64, accepted_modalities={"xray"}, feature_label="X-Ray")
+
     doc_id = _new_id()
     
-    # 2. Simpan data X-Ray DENGAN status sementara
+    # 2. Simpan data X-Ray TANPA auto-analysis (analisis dijalankan manual via tombol "Start Analysis")
     data = {
         "userID": payload.user_id,
         "foto": payload.foto_base64,
         "timestamp": datetime.datetime.now(datetime.timezone.utc),
-        "analysis_result": "Sedang dianalisis oleh Agent... Silakan muat ulang (refresh) halaman beberapa saat lagi." 
+        "analysis_result": "" 
     }
     db.collection(XRAYS_COL).document(doc_id).set(data)
-    
-    # 3. Lempar tugas Gemini ke Background Task agar upload langsung selesai
-    if len(xrays_raw) > 0:
-        old_foto = xrays_raw[0].get("foto", "")
-        background_tasks.add_task(background_analyze, doc_id, old_foto, payload.foto_base64)
     
     return {
         "id": doc_id,
         "action": "inserted",
-        "message": "Foto X-RAY berhasil diupload. Analisis AI sedang berjalan."
+        "message": "Foto X-RAY berhasil diupload. Tekan tombol 'Start Analysis' untuk memulai analisis AI."
     }
+
+
+def start_xray_analysis(user_id: str) -> dict:
+    """Menjalankan analisis AI secara manual berdasarkan 2 gambar X-Ray terbaru milik user."""
+    try:
+        docs = (
+            db.collection(XRAYS_COL)
+            .where(filter=FieldFilter("userID", "==", user_id))
+            .stream()
+        )
+        xrays_raw = []
+        for doc in docs:
+            d = doc.to_dict()
+            xrays_raw.append({
+                "id": doc.id,
+                "foto": d.get("foto", ""),
+                "timestamp": d.get("timestamp"),
+            })
+        xrays_raw.sort(
+            key=lambda x: x["timestamp"] if x["timestamp"] else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+            reverse=True
+        )
+
+        if len(xrays_raw) < 2:
+            return {
+                "status": "error",
+                "message": "Dibutuhkan minimal 2 gambar X-Ray (Sebelumnya & Terbaru) untuk memulai analisis perbandingan."
+            }
+
+        newest = xrays_raw[0]
+        older = xrays_raw[1]
+        analysis_text = analyze_xray_with_gemini(older["foto"], newest["foto"])
+
+        db.collection(XRAYS_COL).document(newest["id"]).update({
+            "analysis_result": analysis_text
+        })
+
+        return {
+            "status": "success",
+            "data": {
+                "id": newest["id"],
+                "analysis": analysis_text
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 def get_latest_two_xrays(user_id: str) -> dict:
     try:

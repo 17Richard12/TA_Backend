@@ -40,6 +40,8 @@ class EditAccountSchema(BaseModel):
     phone: Optional[str] = None
     history: Optional[str] = None
     role: Optional[str] = None
+    smoke_limit_low: Optional[int] = None
+    smoke_limit_high: Optional[int] = None
 
 
 class ChangePasswordSchema(BaseModel):
@@ -58,6 +60,8 @@ class UserResponse(BaseModel):
     weight: Optional[float] = None
     phone: Optional[str] = None
     history: Optional[str] = None
+    smoke_limit_low: Optional[int] = 5
+    smoke_limit_high: Optional[int] = 10
 
 class ActivityRequestSchema(BaseModel):
     date: str                        # Format YYYY-MM-DD
@@ -73,3 +77,6 @@ class OnboardingPayload(BaseModel):
     phone: Optional[str] = None
     history: Optional[str] = None
     initial_smoke_count: int = 0
+    smoke_limit_low: int = 5
+    smoke_limit_high: int = 10
+    timestamp: Optional[str] = None  # Tanggal lokal device user, format YYYY-MM-DD

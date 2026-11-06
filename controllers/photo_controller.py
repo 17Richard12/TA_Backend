@@ -1,4 +1,4 @@
-from schemas.photo_schema import PostPhotoSchema
+from schemas.photo_schema import PostPhotoSchema, AnalyzePhotoSchema
 from fastapi import BackgroundTasks
 from services import photo_service
 
@@ -11,3 +11,6 @@ def save_photo(payload: PostPhotoSchema, background_tasks: BackgroundTasks):
 
 def get_latest_two_photos(user_id: str):
     return photo_service.get_latest_two_photos(user_id)
+
+def analyze_photo(payload: AnalyzePhotoSchema):
+    return photo_service.start_photo_analysis(payload.user_id)

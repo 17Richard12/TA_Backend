@@ -1,6 +1,7 @@
 from config.firebase import db
 from google.cloud.firestore_v1.base_query import FieldFilter
 from datetime import datetime, timezone, timedelta
+from services.smoke_service import find_smoke_doc_ref, aggregate_hourly_logs
 
 SMOKES_COL = "smokeCount" 
 ACTIVITIES_COL = "dailyActivities"
@@ -11,30 +12,10 @@ def get_dashboard_report(user_id: str, date_str: str) -> dict:
     date_str: format 'YYYY-MM-DD'
     """
     # 1. Total Smoke & 4. Hourly Graph
-    smoke_count_total = 0
-    # Initialize hours from 00:00 to 23:00
-    smoke_hourly_dict = {f"{i:02d}:00": 0 for i in range(24)}
-    
-    smoke_docs = list(db.collection("smokeCount")
-                      .where(filter=FieldFilter("userID", "==", user_id))
-                      .where(filter=FieldFilter("timestamp", "==", date_str))
-                      .stream())
-    
-    if smoke_docs:
-        smoke_doc = smoke_docs[0]
-        smoke_count_total = smoke_doc.to_dict().get("count", 0)
-        
-        # Subcollection logs
-        logs = smoke_doc.reference.collection("logs").stream()
-        for log in logs:
-            log_data = log.to_dict()
-            logdate = log_data.get("logdate")
-            if logdate:
-                # Convert to local time UTC+7 for Jakarta
-                local_time = logdate + timedelta(hours=7)
-                hour_local = local_time.hour
-                key = f"{hour_local:02d}:00"
-                smoke_hourly_dict[key] += 1
+    # Gunakan helper yang sama dengan endpoint smoke-count agar angka di Home & Report selalu sinkron
+    smoke_ref, smoke_data = find_smoke_doc_ref(user_id, date_str)
+    smoke_count_total = (smoke_data or {}).get("count", 0)
+    smoke_hourly_dict = aggregate_hourly_logs(smoke_ref)
                 
     smoke_hourly_graph = [{"hour": k, "count": v} for k, v in smoke_hourly_dict.items()]
     
@@ -71,8 +52,22 @@ def get_dashboard_report(user_id: str, date_str: str) -> dict:
             if ts.startswith(date_str):
                 chat_total += 1
                 
+    # Ambil batas rendah & batas tinggi rokok dari profil user
+    smoke_limit_low = 5
+    smoke_limit_high = 10
+    try:
+        user_doc = db.collection("accounts").document(user_id).get()
+        if user_doc.exists:
+            u_data = user_doc.to_dict() or {}
+            smoke_limit_low = int(u_data.get("smoke_limit_low") or 5)
+            smoke_limit_high = int(u_data.get("smoke_limit_high") or 10)
+    except Exception:
+        pass
+
     return {
         "smoke_count_total": smoke_count_total,
+        "smoke_limit_low": smoke_limit_low,
+        "smoke_limit_high": smoke_limit_high,
         "daily_activities_done_total": daily_activities_done_total,
         "chat_total": chat_total,
         "smoke_hourly_graph": smoke_hourly_graph,
@@ -154,12 +149,26 @@ def get_monthly_report(user_id: str, year: int, month: int) -> dict:
                     total_chats += 1
                     available_dates.add(ts.strftime("%Y-%m-%d"))
 
+        # Ambil batas rendah & batas tinggi rokok dari profil user
+        smoke_limit_low = 5
+        smoke_limit_high = 10
+        try:
+            user_doc = db.collection("accounts").document(user_id).get()
+            if user_doc.exists:
+                u_data = user_doc.to_dict() or {}
+                smoke_limit_low = int(u_data.get("smoke_limit_low") or 5)
+                smoke_limit_high = int(u_data.get("smoke_limit_high") or 10)
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "data": {
                 "year": year,
                 "month": month,
                 "total_smoke_count": total_smoke,
+                "smoke_limit_low": smoke_limit_low,
+                "smoke_limit_high": smoke_limit_high,
                 "total_activities": total_activities,
                 "total_chats": total_chats,
                 "available_dates": sorted(list(available_dates)) 

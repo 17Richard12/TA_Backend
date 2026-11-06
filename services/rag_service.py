@@ -1,4 +1,5 @@
 import os
+import urllib.parse
 import chromadb
 from PyPDF2 import PdfReader
 from chromadb.utils import embedding_functions
@@ -60,9 +61,13 @@ def search_journal(query: str, n_results: int = 2) -> str:
     metas = results['metadatas'][0] if results.get('metadatas') and results['metadatas'][0] else [{}] * len(docs)
     
     formatted_chunks = []
+    pubmed_query = urllib.parse.quote_plus(f"lung smoking {query}")
+    pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/?term={pubmed_query}"
     for doc, meta in zip(docs, metas):
         source = meta.get("source", "Jurnal Medis") if isinstance(meta, dict) else "Jurnal Medis"
-        formatted_chunks.append(f"[Sumber Jurnal / Dokumen: {source}]\n{doc}")
+        formatted_chunks.append(
+            f"[Sumber Jurnal / Dokumen: {source} | Tautan Literatur PubMed: {pubmed_url}]\n{doc}"
+        )
 
     # Gabungkan hasil pencarian menjadi satu string konteks
     context = "\n\n---\n\n".join(formatted_chunks)

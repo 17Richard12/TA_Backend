@@ -5,6 +5,12 @@ import hashlib
 import uuid
 from google.cloud.firestore_v1 import FieldFilter
 from datetime import datetime, timedelta
+from services.smoke_service import (
+    find_smoke_doc_ref,
+    aggregate_hourly_logs,
+    set_smoke_total,
+    jakarta_today_str,
+)
 
 
 ACCOUNTS_COL = "accounts"
@@ -36,6 +42,39 @@ def _get_user_by_uid(uid: str):
     return doc.to_dict()
 
 
+PATIENT_ROLES = {"user", "pasien", "patient"}
+
+
+def is_profile_complete(user: dict) -> bool:
+    """
+    Profil dianggap lengkap jika:
+    - role bukan pasien (dokter/master tidak wajib onboarding), ATAU
+    - onboarding sudah diselesaikan, ATAU
+    - field profil wajib sudah terisi (untuk user lama yang mengisi via Edit Profil).
+    """
+    role = str(user.get("role", "user")).strip().lower()
+    if role not in PATIENT_ROLES:
+        return True
+    if user.get("onboarding_completed") is True:
+        return True
+
+    def _filled(key):
+        val = user.get(key)
+        return val is not None and str(val).strip() != ""
+
+    def _positive(key):
+        try:
+            return float(user.get(key) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    return _filled("gender") and _filled("bloodType") and _positive("height") and _positive("weight")
+
+
+def _with_profile_flag(uid: str, user: dict) -> dict:
+    return {"uid": uid, **user, "profile_completed": is_profile_complete(user)}
+
+
 # ---------- service functions ----------
 
 def register_user(payload: RegisterSchema) -> dict:
@@ -56,9 +95,12 @@ def register_user(payload: RegisterSchema) -> dict:
         "weight": 0,
         "phone": "",
         "history": "",
+        "smoke_limit_low": 5,
+        "smoke_limit_high": 10,
+        "onboarding_completed": False,
     }
     db.collection(ACCOUNTS_COL).document(new_uid).set(user_data)
-    return {"uid": new_uid, **user_data}
+    return _with_profile_flag(new_uid, user_data)
 
 
 def login_user(payload: LoginSchema) -> dict:
@@ -69,14 +111,14 @@ def login_user(payload: LoginSchema) -> dict:
     if user.get("password") != _hash_password(payload.password):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    return {"uid": uid, **user}
+    return _with_profile_flag(uid, user)
 
 
 def get_user(uid: str) -> dict:
     user = _get_user_by_uid(uid)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"uid": uid, **user}
+    return _with_profile_flag(uid, user)
 
 
 def edit_account(uid: str, payload: EditAccountSchema) -> dict:
@@ -135,51 +177,16 @@ def get_patient_daily_report(uid: str, date_str: str) -> dict:
     
     # Hapus field password agar aman dikirim ke frontend
     user_data = {k: v for k, v in user.items() if k != "password"}
+    user_data.setdefault("smoke_limit_low", 5)
+    user_data.setdefault("smoke_limit_high", 10)
+    smoke_limit_low = int(user_data.get("smoke_limit_low") or 5)
+    smoke_limit_high = int(user_data.get("smoke_limit_high") or 10)
 
     # 2. Ambil Total Smoke Count + Hourly Graph
-    smoke_hourly_dict = {f"{i:02d}:00": 0 for i in range(24)}
-
-    smoke_docs = list(
-        db.collection("smokeCount")
-        .where(filter=FieldFilter("userID", "==", uid))
-        .where(filter=FieldFilter("timestamp", "==", date_str))
-        .limit(1)
-        .stream()
-    )
-
-    total_smoke = 0
-    if smoke_docs:
-        smoke_doc = smoke_docs[0]
-        total_smoke = smoke_doc.to_dict().get("count", 0)
-
-        # Ambil subcollection logs untuk grafik per jam
-        logs = smoke_doc.reference.collection("logs").stream()
-        for log in logs:
-            log_data = log.to_dict()
-            
-            # Cek properti logdate atau timestamp untuk fleksibilitas
-            logdate = log_data.get("logdate") or log_data.get("timestamp")
-            
-            if logdate:
-                try:
-                    # Parsing data jika Flutter mengirimkan Date String (ISO 8601)
-                    if isinstance(logdate, str):
-                        # Handle 'Z' suffix yang sering dikirim oleh Dart toIso8601String()
-                        parsed_date = datetime.fromisoformat(logdate.replace('Z', '+00:00'))
-                    else:
-                        # Asumsi objek sudah berupa Firestore Datetime / Python datetime
-                        parsed_date = logdate
-
-                    # Konversi ke waktu lokal UTC+7
-                    local_time = parsed_date + timedelta(hours=7)
-                    key = f"{local_time.hour:02d}:00"
-                    
-                    if key in smoke_hourly_dict:
-                        smoke_hourly_dict[key] += 1
-
-                except Exception as e:
-                    # Munculkan error di terminal untuk keperluan debugging (jangan di-pass saja)
-                    print(f"[DEBUG] Error parsing logdate '{logdate}' untuk user {uid}: {e}")
+    # Gunakan helper yang sama dengan endpoint smoke-count agar sinkron dengan Home & Report pasien
+    smoke_ref, smoke_data = find_smoke_doc_ref(uid, date_str)
+    total_smoke = (smoke_data or {}).get("count", 0)
+    smoke_hourly_dict = aggregate_hourly_logs(smoke_ref)
 
     smoke_hourly_graph = [{"hour": k, "count": v} for k, v in smoke_hourly_dict.items()]
 
@@ -217,6 +224,8 @@ def get_patient_daily_report(uid: str, date_str: str) -> dict:
         "report_date": date_str,
         "patient_data": user_data,
         "total_smoke": total_smoke,
+        "smoke_limit_low": smoke_limit_low,
+        "smoke_limit_high": smoke_limit_high,
         "total_activity": total_act,
         "total_activity_done": total_act_done,
         "activities_list": activities_list,
@@ -269,8 +278,13 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 def process_onboarding(uid: str, data: dict):
     try:
-        # 1. Update profil pengguna (ke koleksi "accounts")
         user_ref = db.collection(ACCOUNTS_COL).document(uid)
+        existing_user = user_ref.get()
+        if not existing_user.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+        already_onboarded = (existing_user.to_dict() or {}).get("onboarding_completed") is True
+
+        # 1. Update profil pengguna (ke koleksi "accounts")
         user_ref.set({
             "birth": data.get("birth"),
             "bloodType": data.get("bloodType"),
@@ -279,32 +293,24 @@ def process_onboarding(uid: str, data: dict):
             "weight": data.get("weight"),
             "phone": data.get("phone"),
             "history": data.get("history"),
+            "smoke_limit_low": int(data.get("smoke_limit_low") or 5),
+            "smoke_limit_high": int(data.get("smoke_limit_high") or 10),
             "onboarding_completed": True
         }, merge=True)
 
-        # 2. Inisialisasi Smoke Count & Logs
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        initial_smoke = int(data.get("initial_smoke_count", 0))
-        smoke_doc_id = f"{uid}_{today_str}"
-        
-        # Simpan nilai smoke count
-        db.collection("smokeCount").document(smoke_doc_id).set({
-            "userID": uid,
-            "count": initial_smoke,
-            "timestamp": today_str
-        }, merge=True)
+        # Jika onboarding sudah pernah dilakukan, jangan duplikasi smoke count & aktivitas
+        if already_onboarded:
+            return True
 
-        # --- PERBAIKAN 1: BIKIN LOG ONBOARDING ---
-        # Jika ada jumlah rokok yang diinput, catat log agar terdeteksi di grafik
-        if initial_smoke > 0:
-            log_id = str(uuid.uuid4()).replace("-", "")[:20]
-            db.collection("smokeCount").document(smoke_doc_id).collection("logs").document(log_id).set({
-                "logdate": datetime.now(timezone.utc),
-                "action": "inserted_via_onboarding",
-                "amount": initial_smoke,
-                "previous_total": 0,
-                "new_total": initial_smoke
-            })
+        # 2. Inisialisasi Smoke Count & Logs
+        # Gunakan tanggal dari device user (format YYYY-MM-DD) agar sama dengan yang dibaca Home,
+        # fallback ke tanggal WIB (server Cloud Run berjalan di UTC).
+        today_str = data.get("timestamp") or jakarta_today_str()
+        initial_smoke = int(data.get("initial_smoke_count", 0) or 0)
+
+        # Simpan nilai smoke count via helper yang sama dengan endpoint smoke-count
+        # (otomatis mencatat log delta agar grafik per jam akurat)
+        set_smoke_total(uid, today_str, initial_smoke, action="inserted_via_onboarding")
 
         # --- PERBAIKAN 2: GENERATE MULTIPLE DAILY ACTIVITIES ---
         # Siapkan array penampung. Aktivitas dasar yang selalu ada:
@@ -356,6 +362,8 @@ def process_onboarding(uid: str, data: dict):
             })
 
         return True
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error in process_onboarding: {e}")
         raise e
