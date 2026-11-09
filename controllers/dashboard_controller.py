@@ -1,6 +1,11 @@
+from typing import Optional
 from schemas.dashboard_schema import DashboardResponse
 # 1. Tambahkan 'as service_get_monthly_report' agar namanya tidak bentrok
-from services.dashboard_service import get_dashboard_report, get_monthly_report as service_get_monthly_report
+from services.dashboard_service import (
+    get_dashboard_report,
+    get_monthly_report as service_get_monthly_report,
+    get_yesterday_ai_summary as service_get_yesterday_ai_summary,
+)
 from datetime import datetime
 
 def get_dashboard(user_id: str, date: str) -> DashboardResponse:
@@ -27,3 +32,15 @@ def get_monthly_report(user_id: str, year: int, month: int):
     # 2. Panggil fungsi menggunakan nama aliasnya (TANPA tanda titik di tengahnya)
     result = service_get_monthly_report(user_id, year, month)
     return result
+
+
+def get_yesterday_ai_summary(
+    user_id: str,
+    date: Optional[str] = None,
+    force_refresh: bool = False,
+):
+    return service_get_yesterday_ai_summary(
+        user_id=user_id,
+        date_str=date,
+        force_refresh=force_refresh,
+    )

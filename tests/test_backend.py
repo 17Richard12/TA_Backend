@@ -834,6 +834,79 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
         self.assertIn("ensure_jwt_secret", deploy_script)
         self.assertIn("ensure_maps_secret", deploy_script)
 
+    # -----------------------------------------------------------------
+    # 10. Yesterday AI Summary & Feedback Endpoint Tests
+    # -----------------------------------------------------------------
+    def test_yesterday_ai_summary_endpoint_and_caching(self):
+        # Seed yesterday's data (2026-11-08 when today is 2026-11-09)
+        ok_smoke = self.client.post(
+            "/api/smoke-count/",
+            headers=self._headers(self.token_p1),
+            json={"user_id": "patient_1", "timestamp": "2026-11-08", "total": 3},
+        )
+        self.assertEqual(ok_smoke.status_code, 200)
+
+        # Add 2 activities on 2026-11-08, mark 1 done and leave 1 pending
+        act1 = self.client.post(
+            "/api/users/patient_1/activities",
+            headers=self._headers(self.token_doc1),
+            json={"date": "2026-11-08", "activity": "Latihan pernapasan diafragma"},
+        )
+        act2 = self.client.post(
+            "/api/users/patient_1/activities",
+            headers=self._headers(self.token_doc1),
+            json={"date": "2026-11-08", "activity": "Minum air hangat 8 gelas"},
+        )
+        act1_id = act1.json()["data"]["id"]
+        self.client.patch(
+            f"/api/activities/patient_1_2026-11-08/items/{act1_id}/check",
+            headers=self._headers(self.token_p1),
+            json={"done": True},
+        )
+
+        # Unauthorized patient_2 cannot read patient_1's yesterday AI summary
+        forbidden = self.client.get(
+            "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+            headers=self._headers(self.token_p2),
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        # Patient_1 fetches yesterday AI summary (with mocked Gemini response)
+        class FakeGeminiResponse:
+            text = (
+                '{"summary": "Kemarin Anda merokok 3 batang dan menyelesaikan 1 dari 2 aktivitas harian.", '
+                '"feedback": "Pertahankan rokok di bawah batas rendah dan selesaikan target minum air hangat hari ini."}'
+            )
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "dummy-key"}, clear=False):
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                return_value=FakeGeminiResponse(),
+            ):
+                resp = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertEqual(payload["status"], "success")
+        data = payload["data"]
+        self.assertEqual(data["yesterday_date"], "2026-11-08")
+        self.assertEqual(data["smoke_count_total"], 3)
+        self.assertEqual(data["daily_activities_done_total"], 1)
+        self.assertEqual(data["daily_activities_total"], 2)
+        self.assertEqual(data["source"], "gemini")
+        self.assertIn("merokok 3 batang", data["summary"])
+        self.assertIn("Pertahankan", data["feedback"])
+
+        # Subsequent call with same data signature returns cached summary without calling Gemini
+        resp_cached = self.client.get(
+            "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+            headers=self._headers(self.token_p1),
+        )
+        self.assertEqual(resp_cached.status_code, 200)
+        self.assertEqual(resp_cached.json()["data"]["source"], "cache")
+
 
 if __name__ == "__main__":
     unittest.main()
