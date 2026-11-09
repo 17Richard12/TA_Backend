@@ -9,6 +9,7 @@ from routers.activity_router import router as activity_router
 from routers.smoke_router import router as smoke_router
 from routers.photo_router import router as photo_router
 from routers.dashboard_router import router as dashboard_router
+from routers.hospital_router import router as hospital_router
 from google.adk.runners import InMemoryRunner
 from myAgent.agent import root_agent
 
@@ -40,6 +41,7 @@ app.include_router(smoke_router, prefix="/api")
 app.include_router(photo_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(xray_router, prefix="/api")
+app.include_router(hospital_router, prefix="/api")
 
 
 @app.get("/", tags=["Health"])

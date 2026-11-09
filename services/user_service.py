@@ -97,9 +97,10 @@ def is_profile_complete(user: dict) -> bool:
 
 def _with_profile_flag(uid: str, user: dict, include_token: bool = False) -> dict:
     role = str(user.get("role", "user")).strip().lower()
+    safe_user = {k: v for k, v in user.items() if k != "password"}
     result = {
         "uid": uid,
-        **user,
+        **safe_user,
         "role": role,
         "profile_completed": is_profile_complete(user),
     }

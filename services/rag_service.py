@@ -77,33 +77,44 @@ KNOWN_SOURCE_CITATIONS: Dict[str, Dict[str, str]] = {
 }
 
 
+_ALLOWED_UNICODE_TYPOGRAPHY = set("–—‘’“”•·±×÷≤≥≠≈°µαβγδ™©®‑（），。：；")
+
+
 def is_garbled_text(text: str, max_noise_ratio: float = 0.20) -> bool:
     """
     Mendeteksi apakah teks hasil ekstraksi PDF rusak/garbled (misal akibat font encoding map rusak).
-    Mengembalikan True jika proporsi karakter simbol aneh/non-standar melebihi batas.
+    Mengembalikan True jika proporsi karakter simbol aneh/cipher-shifted melebihi batas,
+    namun tetap mengizinkan tabel statistik dan karakter Unicode/CJK yang valid.
     """
     if not text or not text.strip():
         return True
-    cleaned = "".join(ch for ch in text if not ch.isspace())
+    # Collapse repeated dot leaders (e.g. Table of Contents ".....") before checking ratios
+    normalized = re.sub(r"\.{4,}", "...", text)
+    cleaned = "".join(ch for ch in normalized if not ch.isspace())
     if len(cleaned) < 20:
         return True
 
-    allowed_punct = set(".,;:!?()-/[]'\"%+<>=$#&*@")
+    allowed_punct = set(".,;:!?()-/[]'\"%+<>=$#&*@_") | _ALLOWED_UNICODE_TYPOGRAPHY
     weird_count = 0
-    alpha_count = 0
+    alnum_count = 0
     cipher_symbol_count = 0
     for ch in cleaned:
-        if ch.isalpha():
-            alpha_count += 1
-        if ch in "{}~`|^_\\€" or ord(ch) > 127 or ch == "\ufffd":
+        if ch.isalnum():
+            alnum_count += 1
+        is_cipher_char = (
+            ch in "{}~`|^\\€\ufffd"
+            or ord(ch) < 32
+            or (ord(ch) > 127 and not ch.isalnum() and ch not in _ALLOWED_UNICODE_TYPOGRAPHY)
+        )
+        if is_cipher_char:
             cipher_symbol_count += 1
-        if ord(ch) > 127 or ch == "\ufffd" or (not ch.isalnum() and ch not in allowed_punct):
+        if is_cipher_char or (not ch.isalnum() and ch not in allowed_punct):
             weird_count += 1
 
     noise_ratio = weird_count / len(cleaned)
     if noise_ratio > max_noise_ratio or (cipher_symbol_count / len(cleaned)) > 0.08:
         return True
-    if alpha_count / len(cleaned) < 0.45:
+    if alnum_count / len(cleaned) < 0.25:
         return True
     return False
 
@@ -142,15 +153,25 @@ def extract_doi_and_url(text: str, filename: str = "", pdf_metadata: Optional[di
     return doi, url, title
 
 
+def _get_existing_ids_for_source(col, source_filename: str) -> List[str]:
+    try:
+        existing = col.get(where={"source": source_filename}, include=[])
+        return list(existing.get("ids") or [])
+    except Exception:
+        return []
+
+
 def ingest_pdfs_from_directory(
     directory_path: Optional[str] = None,
     target_collection=None,
 ) -> Dict[str, List[str]]:
     """
     Membaca PDF dari directory_path dan menyimpannya ke Vector DB secara aman:
-    - Menggunakan `collection.upsert` agar tidak menimbulkan duplikasi chunk dan aman untuk re-ingestion.
+    - Strategi document-level replacement: menghapus chunk halaman usang apabila PDF diganti
+      dengan versi yang memiliki halaman lebih sedikit, lalu melakukan `collection.upsert`.
     - Menyimpan `source`, `page` (1-indexed), `doi`, `url`, dan `title` pada metadata.
-    - Mendeteksi PDF yang tidak valid, tidak terbaca, atau memiliki teks garbled (seperti font rusak).
+    - Mendeteksi PDF yang rusak, terenkripsi (encrypted), tidak terbaca, atau memiliki teks garbled,
+      serta memastikan konten rusak tidak masuk ke dalam indeks pencarian RAG.
     """
     dir_path = directory_path or _DEFAULT_DATA_DIR
     col = target_collection if target_collection is not None else collection
@@ -159,6 +180,7 @@ def ingest_pdfs_from_directory(
         "processed": [],
         "corrupted_or_unreadable": [],
         "skipped_empty": [],
+        "obsolete_chunks_removed": [],
     }
 
     if not os.path.isdir(dir_path):
@@ -171,6 +193,16 @@ def ingest_pdfs_from_directory(
 
         try:
             reader = PdfReader(filepath)
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    decrypt_status = reader.decrypt("")
+                except Exception:
+                    decrypt_status = 0
+                if not decrypt_status:
+                    summary["corrupted_or_unreadable"].append(filename)
+                    print(f"[PERINGATAN] PDF {filename} terenkripsi dan tidak dapat dibaca.")
+                    continue
+
             pdf_meta = dict(reader.metadata or {})
             sample_pages_text = "\n".join(
                 (p.extract_text() or "") for p in reader.pages[:3]
@@ -211,41 +243,35 @@ def ingest_pdfs_from_directory(
                     "doi": final_doi,
                     "url": final_url,
                     "title": doc_title or filename,
+                    "is_garbled": False,
                 })
 
             # Jika seluruh halaman di PDF mengalami kerusakan encoding (misal 58.pdf),
-            # catat sebagai corrupted/garbled dan gunakan metadata judul/abstrak yang bersih bila tersedia
+            # catat sebagai corrupted/garbled dan hapus chunk rusak dari koleksi agar tidak terambil saat retrieval
             if not text_chunks and garbled_pages > 0:
                 summary["corrupted_or_unreadable"].append(filename)
-                author = str(pdf_meta.get("/Author") or "").strip()
-                if doc_title:
-                    fallback_text = (
-                        f"Title: {doc_title}\n"
-                        f"Authors: {author}\n"
-                        f"Source Document: {filename}\n"
-                        f"DOI: {doc_doi or '-'}\n"
-                        f"URL: {doc_url or '-'}\n"
-                        "Note: Body text extraction skipped due to corrupted PDF font encoding."
-                    )
-                    col.upsert(
-                        documents=[fallback_text],
-                        ids=[f"{filename}_page_0"],
-                        metadatas=[{
-                            "source": filename,
-                            "page": 1,
-                            "doi": doc_doi,
-                            "url": doc_url,
-                            "title": doc_title,
-                            "corrupted_font": True,
-                        }],
-                    )
-                print(f"[PERINGATAN] PDF {filename} memiliki encoding teks rusak ({garbled_pages} halaman garbled).")
+                stale_corrupted_ids = _get_existing_ids_for_source(col, filename)
+                if stale_corrupted_ids:
+                    col.delete(ids=stale_corrupted_ids)
+                    summary["obsolete_chunks_removed"].extend(stale_corrupted_ids)
+                print(
+                    f"[PERINGATAN] PDF {filename} memiliki encoding teks rusak ({garbled_pages} halaman garbled) "
+                    f"dan dikecualikan dari indeks RAG."
+                )
                 continue
 
             if not text_chunks:
                 summary["skipped_empty"].append(filename)
                 print(f"[PERINGATAN] PDF {filename} tidak memiliki teks yang dapat dibaca.")
                 continue
+
+            # Document-level replacement: hapus chunk lama untuk dokumen ini yang sudah tidak ada di versi baru
+            existing_ids = _get_existing_ids_for_source(col, filename)
+            new_id_set = set(ids)
+            obsolete_ids = [cid for cid in existing_ids if cid not in new_id_set]
+            if obsolete_ids:
+                col.delete(ids=obsolete_ids)
+                summary["obsolete_chunks_removed"].extend(obsolete_ids)
 
             col.upsert(
                 documents=text_chunks,
@@ -357,7 +383,7 @@ def search_journal(query: str, n_results: int = 3, max_distance: float = 1.65) -
         return "Tidak ditemukan referensi medis yang relevan di jurnal lokal."
 
     cleaned_query = str(query).strip()
-    fetch_k = max(n_results * 2, 4)
+    fetch_k = max(n_results * 3, 8)
 
     try:
         results = collection.query(
@@ -386,7 +412,11 @@ def search_journal(query: str, n_results: int = 3, max_distance: float = 1.65) -
             continue
 
         meta_dict = meta if isinstance(meta, dict) else {}
-        if meta_dict.get("is_garbled") is True or is_garbled_text(doc):
+        if (
+            meta_dict.get("is_garbled") is True
+            or meta_dict.get("corrupted_font") is True
+            or is_garbled_text(doc)
+        ):
             continue
 
         source = meta_dict.get("source", "Jurnal Medis")

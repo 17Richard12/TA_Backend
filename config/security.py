@@ -6,9 +6,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import bcrypt
 import jwt
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from config.firebase import db
+
+load_dotenv()
 
 # Optional Argon2 support if argon2-cffi is installed in the environment
 try:
@@ -18,14 +21,59 @@ try:
 except ImportError:
     _argon2_hasher = None
 
-# Use JWT_SECRET_KEY from environment, or derive a deterministic local secret
-# without exposing or logging sensitive environment variables.
-_raw_secret = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
-if not _raw_secret:
-    _fallback_seed = f"lungs-assistant-jwt-secret::{os.getenv('GOOGLE_API_KEY', 'local-dev-key')}"
-    _raw_secret = hashlib.sha256(_fallback_seed.encode("utf-8")).hexdigest()
+MIN_JWT_SECRET_LENGTH: int = 32
+_WEAK_SECRET_PREFIXES = (
+    "lungs-assistant-jwt-secret",
+    "secret",
+    "changeme",
+    "password",
+    "default",
+    "your-secret-key",
+    "test-secret",
+)
 
-JWT_SECRET_KEY: str = _raw_secret
+
+def validate_jwt_secret(raw_secret: Optional[str]) -> str:
+    """
+    Validates that a strong JWT_SECRET_KEY is provided via environment configuration.
+    Raises RuntimeError if missing, shorter than 32 characters, or low-entropy/predictable.
+    Never logs or includes the secret value in error messages.
+    """
+    if raw_secret is None:
+        raise RuntimeError(
+            "JWT_SECRET_KEY environment variable is required and must not be empty."
+        )
+    cleaned = raw_secret.strip()
+    if not cleaned:
+        raise RuntimeError(
+            "JWT_SECRET_KEY environment variable is required and must not be empty."
+        )
+    if len(cleaned) < MIN_JWT_SECRET_LENGTH:
+        raise RuntimeError(
+            f"JWT_SECRET_KEY is too weak: minimum length is {MIN_JWT_SECRET_LENGTH} characters."
+        )
+    lowered = cleaned.lower()
+    if any(lowered.startswith(prefix) for prefix in _WEAK_SECRET_PREFIXES):
+        raise RuntimeError(
+            "JWT_SECRET_KEY uses a disallowed predictable or placeholder value."
+        )
+    if len(set(cleaned)) < 8:
+        raise RuntimeError(
+            "JWT_SECRET_KEY has insufficient entropy (requires at least 8 distinct characters)."
+        )
+    return cleaned
+
+
+def get_jwt_secret_key() -> str:
+    """
+    Retrieves and validates JWT_SECRET_KEY from environment variables.
+    Fails safely if missing or weak.
+    """
+    return validate_jwt_secret(os.getenv("JWT_SECRET_KEY"))
+
+
+# Validate at startup so the application fails fast if JWT_SECRET_KEY is missing or weak
+JWT_SECRET_KEY: str = get_jwt_secret_key()
 JWT_ALGORITHM: str = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "168"))  # 7 days default
 
@@ -100,6 +148,7 @@ def create_access_token(
     role: str = "user",
     expires_delta: Optional[timedelta] = None,
 ) -> str:
+    secret_key = get_jwt_secret_key()
     now = datetime.now(timezone.utc)
     expire = now + (expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS))
     payload = {
@@ -108,12 +157,13 @@ def create_access_token(
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
     }
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, secret_key, algorithm=JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> Dict[str, Any]:
+    secret_key = get_jwt_secret_key()
     try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, secret_key, algorithms=[JWT_ALGORITHM])
         uid = payload.get("sub")
         if not uid:
             raise HTTPException(

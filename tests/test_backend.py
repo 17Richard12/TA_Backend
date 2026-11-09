@@ -529,6 +529,250 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
         self.assertIn("https://doi.org/", result)
         self.assertNotIn("pubmed.ncbi.nlm.nih.gov/?term=", result)
 
+    # -----------------------------------------------------------------
+    # 6. JWT Secret Validation Regression Tests (Task 1)
+    # -----------------------------------------------------------------
+    def test_jwt_secret_validation_missing_weak_and_valid(self):
+        from config.security import (
+            create_access_token,
+            decode_access_token,
+            get_jwt_secret_key,
+            validate_jwt_secret,
+        )
+
+        # Missing secrets must raise RuntimeError
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret(None)
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("")
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("   ")
+
+        # Weak/short secrets (< 32 chars) must raise RuntimeError
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("short-secret-12345")
+
+        # Predictable fallback or placeholder prefixes must raise RuntimeError
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("lungs-assistant-jwt-secret::predictable-seed-value")
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("secret_123456789012345678901234567890")
+
+        # Low-entropy repeated character secret must raise RuntimeError
+        with self.assertRaises(RuntimeError):
+            validate_jwt_secret("a" * 64)
+
+        # Missing env variable at runtime must fail safely
+        with patch.dict(os.environ, {"JWT_SECRET_KEY": ""}, clear=False):
+            with self.assertRaises(RuntimeError):
+                get_jwt_secret_key()
+            with self.assertRaises(RuntimeError):
+                create_access_token("patient_1", "user")
+
+        # Valid strong secret succeeds for token creation and verification
+        valid_secret = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e"
+        with patch.dict(os.environ, {"JWT_SECRET_KEY": valid_secret}, clear=False):
+            self.assertEqual(get_jwt_secret_key(), valid_secret)
+            tok = create_access_token("patient_1", "user")
+            decoded = decode_access_token(tok)
+            self.assertEqual(decoded["sub"], "patient_1")
+            self.assertEqual(decoded["role"], "user")
+
+    # -----------------------------------------------------------------
+    # 7. Google Places Hospital Proxy Endpoint Tests (Task 3)
+    # -----------------------------------------------------------------
+    def test_nearby_hospitals_backend_proxy_auth_and_filtering(self):
+        # Unauthenticated request must return 401
+        unauth = self.client.get("/api/hospitals/nearby?lat=-6.2&lng=106.8")
+        self.assertEqual(unauth.status_code, 401)
+
+        # Out-of-range coordinates must return 422
+        bad_coords = self.client.get(
+            "/api/hospitals/nearby?lat=120.0&lng=106.8",
+            headers=self._headers(self.token_p1),
+        )
+        self.assertEqual(bad_coords.status_code, 422)
+
+        # Mock Google Places API response and verify general hospital filtering
+        mock_places_payload = {
+            "status": "OK",
+            "results": [
+                {
+                    "name": "RSUD Pasar Minggu",
+                    "place_id": "place_rsud_1",
+                    "geometry": {"location": {"lat": -6.294, "lng": 106.820}},
+                    "vicinity": "Jl. TB Simatupang No. 1",
+                    "rating": 4.5,
+                    "opening_hours": {"open_now": True},
+                },
+                {
+                    "name": "RSIA Brawijaya",
+                    "place_id": "place_rsia_2",
+                    "geometry": {"location": {"lat": -6.250, "lng": 106.800}},
+                    "vicinity": "Jl. Taman Brawijaya",
+                    "rating": 4.6,
+                },
+                {
+                    "name": "Klinik Pratama Sehat",
+                    "place_id": "place_klinik_3",
+                    "geometry": {"location": {"lat": -6.260, "lng": 106.810}},
+                    "vicinity": "Jl. Raya",
+                },
+                {
+                    "name": "RS Khusus Mata Nusantara",
+                    "place_id": "place_mata_4",
+                    "geometry": {"location": {"lat": -6.270, "lng": 106.815}},
+                    "vicinity": "Jl. Nusantara",
+                },
+            ],
+        }
+
+        class DummyResponse:
+            status_code = 200
+            content = b"{}"
+
+            @staticmethod
+            def json():
+                return mock_places_payload
+
+        with patch("services.hospital_service.requests.get", return_value=DummyResponse()):
+            resp = self.client.get(
+                "/api/hospitals/nearby?lat=-6.29&lng=106.82&radius=3000",
+                headers=self._headers(self.token_p1),
+            )
+            self.assertEqual(resp.status_code, 200)
+            body = resp.json()
+            self.assertEqual(body["status"], "success")
+            hospitals = body["data"]
+            self.assertEqual(len(hospitals), 1)
+            self.assertEqual(hospitals[0]["name"], "RSUD Pasar Minggu")
+            self.assertEqual(hospitals[0]["doctor_schedules"], [])
+
+    # -----------------------------------------------------------------
+    # 8. RAG Re-Ingestion & Corrupted PDF 58 Exclusion Tests (Task 4 & 5)
+    # -----------------------------------------------------------------
+    def test_rag_document_level_reingestion_and_corrupted_pdf58_exclusion(self):
+        import tempfile
+        from PyPDF2 import PdfReader
+        from services.rag_service import (
+            ingest_pdfs_from_directory,
+            is_garbled_text,
+            search_journal,
+        )
+
+        # In-memory mock ChromaDB collection to test document-level chunk replacement safely
+        class InMemoryChromaCollection:
+            def __init__(self):
+                self.store: Dict[str, Dict[str, Any]] = {}
+
+            def get(self, where: Optional[Dict[str, Any]] = None, include: Optional[List[str]] = None):
+                matched_ids = []
+                matched_metas = []
+                matched_docs = []
+                for cid, entry in self.store.items():
+                    if where:
+                        ok = all(entry["metadata"].get(k) == v for k, v in where.items())
+                        if not ok:
+                            continue
+                    matched_ids.append(cid)
+                    matched_metas.append(entry["metadata"])
+                    matched_docs.append(entry["document"])
+                return {"ids": matched_ids, "metadatas": matched_metas, "documents": matched_docs}
+
+            def upsert(self, documents: List[str], ids: List[str], metadatas: List[Dict[str, Any]]):
+                for cid, doc, meta in zip(ids, documents, metadatas):
+                    self.store[cid] = {"document": doc, "metadata": dict(meta)}
+
+            def delete(self, ids: List[str]):
+                for cid in ids:
+                    self.store.pop(cid, None)
+
+        class FakePage:
+            def __init__(self, text: str):
+                self._text = text
+
+            def extract_text(self) -> str:
+                return self._text
+
+        class FakePdfReader:
+            def __init__(self, pages_text: List[str], is_encrypted: bool = False):
+                self.pages = [FakePage(t) for t in pages_text]
+                self.metadata = {"/Title": "Clinical COPD Study"}
+                self.is_encrypted = is_encrypted
+
+            def decrypt(self, password: str) -> int:
+                return 0 if self.is_encrypted else 1
+
+        mock_col = InMemoryChromaCollection()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample_pdf = os.path.join(tmpdir, "sample_study.pdf")
+            encrypted_pdf = os.path.join(tmpdir, "encrypted_study.pdf")
+            with open(sample_pdf, "wb") as f:
+                f.write(b"%PDF-1.4 dummy")
+            with open(encrypted_pdf, "wb") as f:
+                f.write(b"%PDF-1.4 encrypted")
+
+            four_pages = [
+                f"Page {idx} clinical trial findings on chronic obstructive pulmonary disease and smoking cessation doi: 10.1000/test.{idx}"
+                for idx in range(1, 5)
+            ]
+
+            def reader_factory_v1(filepath):
+                if filepath.endswith("encrypted_study.pdf"):
+                    return FakePdfReader([], is_encrypted=True)
+                return FakePdfReader(four_pages)
+
+            with patch("services.rag_service.PdfReader", side_effect=reader_factory_v1):
+                summary1 = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
+
+            self.assertEqual(summary1["processed"], ["sample_study.pdf"])
+            self.assertEqual(summary1["corrupted_or_unreadable"], ["encrypted_study.pdf"])
+            self.assertEqual(len(mock_col.store), 4)
+            self.assertIn("sample_study.pdf_page_3", mock_col.store)
+
+            # Repeated ingestion of the same 4-page PDF produces zero duplicates
+            with patch("services.rag_service.PdfReader", side_effect=reader_factory_v1):
+                summary_repeat = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
+            self.assertEqual(len(mock_col.store), 4)
+            self.assertEqual(summary_repeat["obsolete_chunks_removed"], [])
+
+            # Replacing sample_study.pdf with a 2-page PDF must remove obsolete pages 2 and 3 (0-indexed)
+            two_pages = four_pages[:2]
+
+            def reader_factory_v2(filepath):
+                if filepath.endswith("encrypted_study.pdf"):
+                    return FakePdfReader([], is_encrypted=True)
+                return FakePdfReader(two_pages)
+
+            with patch("services.rag_service.PdfReader", side_effect=reader_factory_v2):
+                summary2 = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
+
+            self.assertEqual(len(mock_col.store), 2)
+            self.assertIn("sample_study.pdf_page_0", mock_col.store)
+            self.assertIn("sample_study.pdf_page_1", mock_col.store)
+            self.assertNotIn("sample_study.pdf_page_2", mock_col.store)
+            self.assertNotIn("sample_study.pdf_page_3", mock_col.store)
+            self.assertEqual(
+                 sorted(summary2["obsolete_chunks_removed"]),
+                ["sample_study.pdf_page_2", "sample_study.pdf_page_3"],
+            )
+
+        # Verify 58.pdf in TA_Backend/data/58.pdf has corrupted font encoding and is excluded from RAG retrieval
+        pdf58_path = os.path.join(BACKEND_DIR, "data", "58.pdf")
+        self.assertTrue(os.path.exists(pdf58_path))
+        reader58 = PdfReader(pdf58_path)
+        self.assertEqual(len(reader58.pages), 18)
+        for p in reader58.pages:
+            self.assertTrue(is_garbled_text(p.extract_text() or ""))
+
+        rag_res = search_journal(
+            "Effect of tobacco smoking on the risk of developing community acquired pneumonia",
+            n_results=5,
+        )
+        self.assertNotIn("Sumber Jurnal / Dokumen: 58.pdf", rag_res)
+        self.assertNotIn("ZK[KF", rag_res)
+
 
 if __name__ == "__main__":
     unittest.main()
