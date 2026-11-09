@@ -10,3 +10,5 @@ google-genai
 chromadb==1.5.9
 PyPDF2
 sentence-transformers
+bcrypt
+PyJWT

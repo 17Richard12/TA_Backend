@@ -1,8 +1,9 @@
 import uuid
-from config.firebase import db
-from schemas.smoke_schema import SmokeCountSchema
-from google.cloud.firestore_v1.base_query import FieldFilter
 from datetime import datetime, timedelta, timezone
+from fastapi import HTTPException
+from google.cloud.firestore_v1.base_query import FieldFilter
+from config.firebase import db
+from schemas.smoke_schema import SmokeCountSchema, normalize_smoke_date_str
 
 SMOKE_COL = "smokeCount"
 JAKARTA_TZ = timezone(timedelta(hours=7))
@@ -23,9 +24,10 @@ def _deterministic_doc_id(user_id: str, timestamp: str) -> str:
 
 
 def _find_smoke_doc(user_id: str, timestamp: str):
-    """Mencari dokumen berdasarkan userID dan timestamp."""
+    """Mencari dokumen berdasarkan userID dan timestamp (dinormalisasi ke YYYY-MM-DD)."""
+    normalized_ts = normalize_smoke_date_str(timestamp)
     # 1. Cek ID deterministik terlebih dahulu (data baru)
-    det_ref = db.collection(SMOKE_COL).document(_deterministic_doc_id(user_id, timestamp))
+    det_ref = db.collection(SMOKE_COL).document(_deterministic_doc_id(user_id, normalized_ts))
     det_doc = det_ref.get()
     if det_doc.exists:
         return det_doc.id, det_doc.to_dict()
@@ -34,7 +36,7 @@ def _find_smoke_doc(user_id: str, timestamp: str):
     docs = (
         db.collection(SMOKE_COL)
         .where(filter=FieldFilter("userID", "==", user_id))
-        .where(filter=FieldFilter("timestamp", "==", timestamp))
+        .where(filter=FieldFilter("timestamp", "==", normalized_ts))
         .limit(1)
         .stream()
     )
@@ -86,8 +88,15 @@ def set_smoke_total(user_id: str, timestamp: str, new_total: int, action: str = 
     Menyimpan total rokok harian dan mencatat log berisi delta perubahan.
     Dipakai oleh POST/PUT smoke-count dan proses onboarding.
     """
-    new_total = max(int(new_total), 0)
-    doc_id, existing_data = _find_smoke_doc(user_id, timestamp)
+    if int(new_total) < 0 or int(new_total) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Jumlah rokok harus bernilai antara 0 hingga 200.",
+        )
+
+    normalized_ts = normalize_smoke_date_str(timestamp)
+    new_total = int(new_total)
+    doc_id, existing_data = _find_smoke_doc(user_id, normalized_ts)
 
     if existing_data:
         previous_total = int(existing_data.get("count", 0) or 0)
@@ -96,11 +105,11 @@ def set_smoke_total(user_id: str, timestamp: str, new_total: int, action: str = 
         result_action = action
     else:
         previous_total = 0
-        doc_id = _deterministic_doc_id(user_id, timestamp)
+        doc_id = _deterministic_doc_id(user_id, normalized_ts)
         doc_ref = db.collection(SMOKE_COL).document(doc_id)
         doc_ref.set({
             "userID": user_id,
-            "timestamp": timestamp,
+            "timestamp": normalized_ts,
             "count": new_total,
             "updatedAt": datetime.now(timezone.utc),
         }, merge=True)
@@ -135,43 +144,43 @@ def update_smoke_count(payload: SmokeCountSchema) -> dict:
 
 def get_smoke_count(user_id: str, timestamp: str) -> dict:
     """Mengambil data smoke count berdasarkan userID dan timestamp harian."""
-    doc_id, existing_data = _find_smoke_doc(user_id, timestamp)
-    
+    normalized_ts = normalize_smoke_date_str(timestamp)
+    doc_id, existing_data = _find_smoke_doc(user_id, normalized_ts)
+
     if not existing_data:
-        # Jika data belum ada untuk hari ini, kembalikan default 0 agar frontend tidak error
         return {
             "id": None,
             "userID": user_id,
-            "timestamp": timestamp,
-            "count": 0
+            "timestamp": normalized_ts,
+            "count": 0,
         }
-        
+
     return {
         "id": doc_id,
         "userID": existing_data.get("userID"),
         "timestamp": existing_data.get("timestamp"),
-        "count": existing_data.get("count", 0)
+        "count": max(0, int(existing_data.get("count", 0) or 0)),
     }
 
+
 def get_weekly_report(user_id: str, end_timestamp: str) -> list:
-    try:
-        # 1. Konversi input (dd/mm/yyyy dari frontend/postman) menjadi objek datetime
-        end_date = datetime.strptime(end_timestamp, "%d/%m/%Y")
-    except ValueError:
-        raise ValueError("Format tanggal tidak valid. Gunakan dd/mm/yyyy")
+    cleaned = (end_timestamp or "").strip()
+    end_date = None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            end_date = datetime.strptime(cleaned, fmt)
+            break
+        except ValueError:
+            continue
+    if end_date is None:
+        raise ValueError("Format tanggal tidak valid. Gunakan dd/mm/yyyy atau YYYY-MM-DD")
 
-    # 2. Buat list tanggal untuk Query ke Database (Wajib YYYY-MM-DD sesuai screenshot)
     date_list_db = [(end_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-    date_list_db.reverse() 
-    
-    # Cetak ke terminal untuk memastikan format yang dicari benar
-    print("Mencari di DB dengan tanggal:", date_list_db)
+    date_list_db.reverse()
 
-    # Buat list tanggal untuk ditampilkan ke Response JSON (Format DD/MM/YYYY)
     date_list_display = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(7)]
     date_list_display.reverse()
 
-    # 3. Query ke Firestore
     docs = (
         db.collection(SMOKE_COL)
         .where(filter=FieldFilter("userID", "==", user_id))
@@ -179,22 +188,21 @@ def get_weekly_report(user_id: str, end_timestamp: str) -> list:
         .stream()
     )
 
-    # 4. Mapping data hasil pencarian
     db_data = {}
     for doc in docs:
-        data = doc.to_dict()
-        # Menyimpan data dengan key format YYYY-MM-DD
-        db_data[data["timestamp"]] = data.get("count", 0)
+        data = doc.to_dict() or {}
+        ts = data.get("timestamp")
+        if ts:
+            db_data[ts] = max(0, int(data.get("count", 0) or 0))
 
-    # 5. Gabungkan menjadi array response akhir
     report_data = []
     for i in range(7):
-        db_format = date_list_db[i]           # contoh: "2026-09-24"
-        display_format = date_list_display[i] # contoh: "24/09/2026"
-        
+        db_format = date_list_db[i]
+        display_format = date_list_display[i]
+
         report_data.append({
-            "timestamp": display_format, 
-            "count": db_data.get(db_format, 0) 
+            "timestamp": display_format,
+            "count": db_data.get(db_format, 0),
         })
 
     return report_data

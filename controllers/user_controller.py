@@ -1,3 +1,5 @@
+from typing import Any, Dict, Optional
+from fastapi import HTTPException
 from schemas.user_schema import (
     RegisterSchema,
     LoginSchema,
@@ -35,8 +37,12 @@ def get_user(uid: str):
     }
 
 
-def edit_account(uid: str, payload: EditAccountSchema):
-    user = user_service.edit_account(uid, payload)
+def edit_account(
+    uid: str,
+    payload: EditAccountSchema,
+    current_user: Optional[Dict[str, Any]] = None,
+):
+    user = user_service.edit_account(uid, payload, current_user=current_user)
     return {
         "status": "success",
         "message": "Account updated successfully",
@@ -56,24 +62,24 @@ def _sanitize(user: dict) -> dict:
     """Remove sensitive fields before returning to client."""
     return {k: v for k, v in user.items() if k != "password"}
 
+
 def get_all_users():
     users = user_service.get_all_users()
-    # Looping untuk menghapus field password dari masing-masing user
     sanitized_users = [_sanitize(user) for user in users]
-    
     return {
         "status": "success",
-        "data": sanitized_users
+        "data": sanitized_users,
     }
 
-def get_patients():
-    users = user_service.get_patients()
+
+def get_patients(current_user: Optional[Dict[str, Any]] = None):
+    users = user_service.get_patients(current_user=current_user)
     sanitized_users = [_sanitize(user) for user in users]
-    
     return {
         "status": "success",
-        "data": sanitized_users
+        "data": sanitized_users,
     }
+
 
 def get_patient_daily_report(uid: str, date_str: str):
     try:
@@ -81,24 +87,24 @@ def get_patient_daily_report(uid: str, date_str: str):
         return {
             "status": "success",
             "message": "Berhasil mengambil laporan pasien",
-            "data": report
+            "data": report,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(e),
         }
+
 
 def submit_onboarding(uid: str, payload: OnboardingPayload):
     try:
-        # Ubah payload Pydantic menjadi dictionary untuk diproses service
-        result = user_service.process_onboarding(uid, payload.dict())
-        
+        result = user_service.process_onboarding(uid, payload.model_dump())
         if result:
             return {"status": "success", "message": "Data onboarding berhasil disimpan"}
-        else:
-            return {"status": "error", "message": "Gagal menyimpan data onboarding"}
-            
+        return {"status": "error", "message": "Gagal menyimpan data onboarding"}
+    except HTTPException:
+        raise
     except Exception as e:
-        # Menangkap error dan mengembalikannya dengan format API yang bersih
         return {"status": "error", "message": str(e)}

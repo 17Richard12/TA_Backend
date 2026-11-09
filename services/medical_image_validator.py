@@ -18,7 +18,7 @@ from fastapi import HTTPException
 
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-VALIDATOR_MODEL = os.getenv("MEDICAL_VALIDATOR_MODEL", "gemini-3.7-flash")
+VALIDATOR_MODEL = os.getenv("MEDICAL_VALIDATOR_MODEL", "gemini-2.5-flash")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 MIN_IMAGE_BYTES = 1024             # < 1 KB hampir pasti bukan gambar valid
 MIN_CONFIDENCE = 0.6

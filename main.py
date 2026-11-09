@@ -18,11 +18,15 @@ app = FastAPI(
     description="Backend API for Flutter Lungs Assistant Agent app",
 )
 
+raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=allowed_origins != ["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # Inisialisasi runner dan simpan ke app.state
@@ -36,12 +40,13 @@ app.include_router(smoke_router, prefix="/api")
 app.include_router(photo_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(xray_router, prefix="/api")
+
+
 @app.get("/", tags=["Health"])
 def health_check():
     return {"status": "ok", "message": "Server is running"}
 
+
 if __name__ == "__main__":
-    # Mengambil port dari environment variable (default ke 8080 jika tidak ada)
     port = int(os.environ.get("PORT", 8080))
-    # Wajib menggunakan host 0.0.0.0 untuk Cloud Run
     uvicorn.run("main:app", host="0.0.0.0", port=port)
