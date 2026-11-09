@@ -660,10 +660,13 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
             search_journal,
         )
 
-        # In-memory mock ChromaDB collection to test document-level chunk replacement safely
+        # In-memory mock ChromaDB collection to test document-level chunk replacement & rollback safely
         class InMemoryChromaCollection:
             def __init__(self):
                 self.store: Dict[str, Dict[str, Any]] = {}
+                self.op_log: List[str] = []
+                self.fail_next_upsert: bool = False
+                self.fail_next_delete: bool = False
 
             def get(self, where: Optional[Dict[str, Any]] = None, include: Optional[List[str]] = None):
                 matched_ids = []
@@ -675,15 +678,26 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
                         if not ok:
                             continue
                     matched_ids.append(cid)
-                    matched_metas.append(entry["metadata"])
+                    matched_metas.append(dict(entry["metadata"]))
                     matched_docs.append(entry["document"])
                 return {"ids": matched_ids, "metadatas": matched_metas, "documents": matched_docs}
 
             def upsert(self, documents: List[str], ids: List[str], metadatas: List[Dict[str, Any]]):
+                self.op_log.append("upsert")
+                if self.fail_next_upsert:
+                    self.fail_next_upsert = False
+                    # Simulate partial write before exception
+                    if ids:
+                        self.store[ids[0]] = {"document": "PARTIAL_CORRUPT_WRITE", "metadata": dict(metadatas[0])}
+                    raise RuntimeError("Simulated ChromaDB upsert failure")
                 for cid, doc, meta in zip(ids, documents, metadatas):
                     self.store[cid] = {"document": doc, "metadata": dict(meta)}
 
             def delete(self, ids: List[str]):
+                self.op_log.append("delete")
+                if self.fail_next_delete:
+                    self.fail_next_delete = False
+                    raise RuntimeError("Simulated ChromaDB delete interruption")
                 for cid in ids:
                     self.store.pop(cid, None)
 
@@ -737,7 +751,8 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
             self.assertEqual(len(mock_col.store), 4)
             self.assertEqual(summary_repeat["obsolete_chunks_removed"], [])
 
-            # Replacing sample_study.pdf with a 2-page PDF must remove obsolete pages 2 and 3 (0-indexed)
+            # Simulate upsert failure when attempting to replace 4-page PDF with 2-page PDF:
+            # All 4 original pages must be preserved/restored via rollback!
             two_pages = four_pages[:2]
 
             def reader_factory_v2(filepath):
@@ -745,16 +760,41 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
                     return FakePdfReader([], is_encrypted=True)
                 return FakePdfReader(two_pages)
 
+            mock_col.fail_next_upsert = True
+            with patch("services.rag_service.PdfReader", side_effect=reader_factory_v2):
+                summary_fail_upsert = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
+
+            self.assertEqual(summary_fail_upsert["rolled_back"], ["sample_study.pdf"])
+            self.assertEqual(len(mock_col.store), 4)
+            self.assertNotEqual(mock_col.store["sample_study.pdf_page_0"]["document"], "PARTIAL_CORRUPT_WRITE")
+            self.assertIn("sample_study.pdf_page_3", mock_col.store)
+
+            # Simulate interruption during obsolete chunk deletion: must also roll back to 4 original pages
+            mock_col.fail_next_delete = True
+            with patch("services.rag_service.PdfReader", side_effect=reader_factory_v2):
+                summary_fail_del = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
+
+            self.assertEqual(summary_fail_del["rolled_back"], ["sample_study.pdf"])
+            self.assertEqual(len(mock_col.store), 4)
+            self.assertIn("sample_study.pdf_page_3", mock_col.store)
+
+            # Successful replacement: verify upsert happens BEFORE delete, and obsolete pages 2 & 3 are removed
+            mock_col.op_log.clear()
             with patch("services.rag_service.PdfReader", side_effect=reader_factory_v2):
                 summary2 = ingest_pdfs_from_directory(tmpdir, target_collection=mock_col)
 
+            self.assertEqual(mock_col.op_log, ["upsert", "delete"])
             self.assertEqual(len(mock_col.store), 2)
             self.assertIn("sample_study.pdf_page_0", mock_col.store)
             self.assertIn("sample_study.pdf_page_1", mock_col.store)
             self.assertNotIn("sample_study.pdf_page_2", mock_col.store)
             self.assertNotIn("sample_study.pdf_page_3", mock_col.store)
             self.assertEqual(
-                 sorted(summary2["obsolete_chunks_removed"]),
+                mock_col.store["sample_study.pdf_page_0"]["metadata"]["doc_id"],
+                "sample_study.pdf",
+            )
+            self.assertEqual(
+                sorted(summary2["obsolete_chunks_removed"]),
                 ["sample_study.pdf_page_2", "sample_study.pdf_page_3"],
             )
 
@@ -772,6 +812,27 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
         )
         self.assertNotIn("Sumber Jurnal / Dokumen: 58.pdf", rag_res)
         self.assertNotIn("ZK[KF", rag_res)
+
+    # -----------------------------------------------------------------
+    # 9. Dependencies & Cloud Run Deployment Script Validation (Task 1 & 5)
+    # -----------------------------------------------------------------
+    def test_dependencies_and_deployment_script_configuration(self):
+        req_path = os.path.join(BACKEND_DIR, "Requirements.txt")
+        with open(req_path, "r") as f:
+            reqs = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
+
+        for expected_pkg in ("fastapi", "requests", "pyjwt", "bcrypt", "chromadb==1.5.9", "pypdf2"):
+            self.assertIn(expected_pkg, reqs)
+
+        deploy_path = os.path.join(BACKEND_DIR, "deploy.sh")
+        with open(deploy_path, "r") as f:
+            deploy_script = f.read()
+
+        self.assertIn("JWT_SECRET_KEY=${JWT_SECRET_NAME}:latest", deploy_script)
+        self.assertIn("GOOGLE_MAPS_API_KEY=${MAPS_SECRET_NAME}:latest", deploy_script)
+        self.assertIn("GOOGLE_API_KEY=${SECRET_NAME}:latest", deploy_script)
+        self.assertIn("ensure_jwt_secret", deploy_script)
+        self.assertIn("ensure_maps_secret", deploy_script)
 
 
 if __name__ == "__main__":

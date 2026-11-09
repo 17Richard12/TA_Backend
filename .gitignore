@@ -147,8 +147,10 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments & Local Secrets
 .env
+.env.*
+*.env
 .envrc
 .venv
 env/
@@ -156,6 +158,30 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Firebase & Cloud Service Account Credentials (never commit)
+*serviceAccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+*credentials*.json
+config/*firebase*.json
+config/*service*.json
+
+# macOS & Temporary Files
+.DS_Store
+**/.DS_Store
+*.tmp
+*.bak
+*.swp
+*~
+~$*
+
+# ChromaDB temporary WAL / lock files (keep tracked data/vector_db index for Cloud Run)
+chroma_db/
+data/vector_db/*.sqlite3-wal
+data/vector_db/*.sqlite3-shm
+data/vector_db/*.sqlite3-journal
+data/vector_db/**/*.lock
 
 # Spyder project settings
 .spyderproject

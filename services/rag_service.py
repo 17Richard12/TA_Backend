@@ -161,17 +161,65 @@ def _get_existing_ids_for_source(col, source_filename: str) -> List[str]:
         return []
 
 
+def _snapshot_source_chunks(col, source_filename: str) -> Tuple[List[str], List[str], List[dict]]:
+    """
+    Mengambil snapshot (ids, documents, metadatas) dari seluruh chunk milik `source_filename`
+    sebelum pembaruan dilakukan, sehingga dapat di-rollback apabila terjadi kegagalan parsial.
+    """
+    try:
+        existing = col.get(
+            where={"source": source_filename},
+            include=["documents", "metadatas"],
+        )
+        prev_ids = list(existing.get("ids") or [])
+        prev_docs = list(existing.get("documents") or [])
+        prev_metas = [dict(m or {}) for m in (existing.get("metadatas") or [])]
+        return prev_ids, prev_docs, prev_metas
+    except Exception:
+        return [], [], []
+
+
+def _rollback_source_chunks(
+    col,
+    new_ids: List[str],
+    prev_ids: List[str],
+    prev_docs: List[str],
+    prev_metas: List[dict],
+) -> bool:
+    """
+    Memulihkan state dokumen `source_filename` ke snapshot semula apabila operasi
+    `upsert` atau penghapusan chunk usang mengalami kegagalan di tengah proses.
+    """
+    try:
+        added_only = [cid for cid in new_ids if cid not in set(prev_ids)]
+        if added_only:
+            col.delete(ids=added_only)
+        if prev_ids and len(prev_ids) == len(prev_docs) == len(prev_metas):
+            col.upsert(
+                ids=prev_ids,
+                documents=prev_docs,
+                metadatas=prev_metas,
+            )
+        return True
+    except Exception as rollback_err:
+        print(f"[PERINGATAN] Gagal melakukan rollback ChromaDB: {rollback_err}")
+        return False
+
+
 def ingest_pdfs_from_directory(
     directory_path: Optional[str] = None,
     target_collection=None,
 ) -> Dict[str, List[str]]:
     """
-    Membaca PDF dari directory_path dan menyimpannya ke Vector DB secara aman:
-    - Strategi document-level replacement: menghapus chunk halaman usang apabila PDF diganti
-      dengan versi yang memiliki halaman lebih sedikit, lalu melakukan `collection.upsert`.
-    - Menyimpan `source`, `page` (1-indexed), `doi`, `url`, dan `title` pada metadata.
-    - Mendeteksi PDF yang rusak, terenkripsi (encrypted), tidak terbaca, atau memiliki teks garbled,
-      serta memastikan konten rusak tidak masuk ke dalam indeks pencarian RAG.
+    Membaca PDF dari directory_path dan menyimpannya ke Vector DB secara aman (failure-safe):
+    1. Menyiapkan dan memvalidasi seluruh chunk pengganti di memori terlebih dahulu.
+    2. Mengambil snapshot chunk lama untuk dokumen terkait sebelum menyentuh indeks.
+    3. Melakukan `collection.upsert` chunk baru TERLEBIH DAHULU sebelum menghapus chunk halaman
+       usang (`obsolete_ids`), serta melakukan rollback otomatis ke snapshot semula apabila
+       terjadi kegagalan saat upsert/delete.
+    4. Menyimpan metadata `doc_id`, `source`, `page` (1-indexed), `doi`, `url`, dan `title`.
+    5. Mendeteksi PDF yang rusak, terenkripsi, tidak terbaca, atau memiliki teks garbled (`58.pdf`),
+       serta memastikan konten rusak tidak masuk ke hasil pencarian RAG.
     """
     dir_path = directory_path or _DEFAULT_DATA_DIR
     col = target_collection if target_collection is not None else collection
@@ -181,6 +229,7 @@ def ingest_pdfs_from_directory(
         "corrupted_or_unreadable": [],
         "skipped_empty": [],
         "obsolete_chunks_removed": [],
+        "rolled_back": [],
     }
 
     if not os.path.isdir(dir_path):
@@ -238,22 +287,31 @@ def ingest_pdfs_from_directory(
                 text_chunks.append(text)
                 ids.append(f"{filename}_page_{i}")
                 metadatas.append({
+                    "doc_id": filename,
                     "source": filename,
-                    "page": page_num,
-                    "doi": final_doi,
-                    "url": final_url,
-                    "title": doc_title or filename,
+                    "page": int(page_num),
+                    "doi": str(final_doi),
+                    "url": str(final_url),
+                    "title": str(doc_title or filename),
                     "is_garbled": False,
                 })
 
             # Jika seluruh halaman di PDF mengalami kerusakan encoding (misal 58.pdf),
-            # catat sebagai corrupted/garbled dan hapus chunk rusak dari koleksi agar tidak terambil saat retrieval
+            # catat sebagai corrupted/garbled. Hanya hapus chunk lama di indeks apabila chunk lama
+            # tersebut juga terbukti garbled (sehingga chunk valid sebelumnya tidak hilang jika file baru rusak).
             if not text_chunks and garbled_pages > 0:
                 summary["corrupted_or_unreadable"].append(filename)
-                stale_corrupted_ids = _get_existing_ids_for_source(col, filename)
-                if stale_corrupted_ids:
-                    col.delete(ids=stale_corrupted_ids)
-                    summary["obsolete_chunks_removed"].extend(stale_corrupted_ids)
+                prev_ids, prev_docs, prev_metas = _snapshot_source_chunks(col, filename)
+                garbled_existing_ids = [
+                    cid
+                    for cid, doc_txt, m in zip(prev_ids, prev_docs, prev_metas)
+                    if m.get("is_garbled") is True
+                    or m.get("corrupted_font") is True
+                    or is_garbled_text(doc_txt or "")
+                ]
+                if garbled_existing_ids:
+                    col.delete(ids=garbled_existing_ids)
+                    summary["obsolete_chunks_removed"].extend(garbled_existing_ids)
                 print(
                     f"[PERINGATAN] PDF {filename} memiliki encoding teks rusak ({garbled_pages} halaman garbled) "
                     f"dan dikecualikan dari indeks RAG."
@@ -265,19 +323,31 @@ def ingest_pdfs_from_directory(
                 print(f"[PERINGATAN] PDF {filename} tidak memiliki teks yang dapat dibaca.")
                 continue
 
-            # Document-level replacement: hapus chunk lama untuk dokumen ini yang sudah tidak ada di versi baru
-            existing_ids = _get_existing_ids_for_source(col, filename)
+            # Ambil snapshot state lama sebelum memodifikasi indeks
+            prev_ids, prev_docs, prev_metas = _snapshot_source_chunks(col, filename)
             new_id_set = set(ids)
-            obsolete_ids = [cid for cid in existing_ids if cid not in new_id_set]
-            if obsolete_ids:
-                col.delete(ids=obsolete_ids)
-                summary["obsolete_chunks_removed"].extend(obsolete_ids)
+            obsolete_ids = [cid for cid in prev_ids if cid not in new_id_set]
 
-            col.upsert(
-                documents=text_chunks,
-                ids=ids,
-                metadatas=metadatas,
-            )
+            try:
+                # 1. Upsert chunk pengganti terlebih dahulu sebelum menghapus chunk usang
+                col.upsert(
+                    documents=text_chunks,
+                    ids=ids,
+                    metadatas=metadatas,
+                )
+                # 2. Hapus chunk halaman usang setelah upsert berhasil
+                if obsolete_ids:
+                    col.delete(ids=obsolete_ids)
+                    summary["obsolete_chunks_removed"].extend(obsolete_ids)
+            except Exception as write_err:
+                _rollback_source_chunks(col, ids, prev_ids, prev_docs, prev_metas)
+                summary["rolled_back"].append(filename)
+                summary["corrupted_or_unreadable"].append(filename)
+                print(
+                    f"[PERINGATAN] Gagal memperbarui indeks untuk {filename} (telah di-rollback): {write_err}"
+                )
+                continue
+
             summary["processed"].append(filename)
             print(f"Berhasil memproses jurnal: {filename} ({len(text_chunks)} halaman valid)")
         except Exception as e:
@@ -351,7 +421,8 @@ def enrich_existing_collection_metadata(
         garbled = is_garbled_text(doc_text or "")
 
         updated_meta = {
-            "source": source,
+            "doc_id": str(source),
+            "source": str(source),
             "page": int(page_num),
             "doi": str(final_doi),
             "url": str(final_url),

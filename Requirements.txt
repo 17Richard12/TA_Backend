@@ -12,3 +12,4 @@ PyPDF2
 sentence-transformers
 bcrypt
 PyJWT
+requests

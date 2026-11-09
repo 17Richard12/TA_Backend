@@ -7,6 +7,7 @@ if __name__ == "__main__":
         f"Ringkasan ingest: {len(summary['processed'])} diproses, "
         f"{len(summary['corrupted_or_unreadable'])} rusak/tidak terbaca, "
         f"{len(summary['skipped_empty'])} kosong, "
-        f"{len(summary.get('obsolete_chunks_removed', []))} chunk usang dihapus."
+        f"{len(summary.get('obsolete_chunks_removed', []))} chunk usang dihapus, "
+        f"{len(summary.get('rolled_back', []))} di-rollback."
     )
     print("Proses Ingest Selesai! Database vektor siap digunakan.")

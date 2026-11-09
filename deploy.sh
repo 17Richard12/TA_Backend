@@ -8,7 +8,9 @@
 #
 #  Pemakaian (jalankan dari folder TA_Backend, tempat main.py berada):
 #    ./deploy.sh                 deploy / update backend
-#    ./deploy.sh secret          perbarui isi secret GOOGLE_API_KEY
+#    ./deploy.sh secret          perbarui isi secret GOOGLE_API_KEY (Gemini)
+#    ./deploy.sh jwt-secret      perbarui isi secret JWT_SECRET_KEY (min 32 karakter)
+#    ./deploy.sh maps-secret     perbarui isi secret GOOGLE_MAPS_API_KEY (Places API)
 #    ./deploy.sh firebase-secret perbarui isi secret Firebase service account
 #    ./deploy.sh url             tampilkan URL layanan
 #    ./deploy.sh logs            tampilkan log terbaru
@@ -25,12 +27,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # ------------------------------ KONFIGURASI --------------------------------
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
-REGION="${REGION:-asia-southeast2}"          # Jakarta
-SERVICE="${SERVICE:-lungs-backend}"          # nama layanan Cloud Run
-REPO="${REPO:-lungs-backend}"                # repository Artifact Registry
-SA_NAME="${SA_NAME:-lungs-backend-sa}"       # service account runtime
-SECRET_NAME="${SECRET_NAME:-gemini-api-key}" # nama secret di Secret Manager
-FIREBASE_SECRET_NAME="${FIREBASE_SECRET_NAME:-firebase-key}" # nama secret service account Firebase
+REGION="${REGION:-asia-southeast2}"                        # Jakarta
+SERVICE="${SERVICE:-lungs-backend}"                        # nama layanan Cloud Run
+REPO="${REPO:-lungs-backend}"                              # repository Artifact Registry
+SA_NAME="${SA_NAME:-lungs-backend-sa}"                     # service account runtime
+SECRET_NAME="${SECRET_NAME:-gemini-api-key}"               # secret GOOGLE_API_KEY di Secret Manager
+JWT_SECRET_NAME="${JWT_SECRET_NAME:-jwt-secret-key}"       # secret JWT_SECRET_KEY di Secret Manager
+MAPS_SECRET_NAME="${MAPS_SECRET_NAME:-google-maps-api-key}" # secret GOOGLE_MAPS_API_KEY di Secret Manager
+FIREBASE_SECRET_NAME="${FIREBASE_SECRET_NAME:-firebase-key}" # secret service account Firebase
 
 CPU="${CPU:-1}"
 MEMORY="${MEMORY:-2Gi}"
@@ -47,6 +51,33 @@ info() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[33m! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+read_env_var_from_dotenv() {
+  local key="$1"
+  if [[ -f .env ]]; then
+    grep -E "^${key}=" .env | head -n1 | cut -d= -f2- | tr -d "\r\"'" || true
+  fi
+}
+
+validate_jwt_secret_strength() {
+  local s="${1:-}"
+  [[ -n "$s" ]] || die "JWT_SECRET_KEY tidak boleh kosong."
+  if (( ${#s} < 32 )); then
+    die "JWT_SECRET_KEY terlalu pendek (minimal 32 karakter)."
+  fi
+  local lower
+  lower="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+  for prefix in "lungs-assistant-jwt-secret" "secret" "changeme" "password" "default" "your-secret-key" "test-secret"; do
+    if [[ "$lower" == "${prefix}"* ]]; then
+      die "JWT_SECRET_KEY menggunakan nilai placeholder/prediktabel yang tidak diizinkan."
+    fi
+  done
+  local unique_chars
+  unique_chars="$(printf '%s' "$s" | fold -w1 | sort -u | wc -l | tr -d ' ')"
+  if (( unique_chars < 8 )); then
+    die "JWT_SECRET_KEY memiliki entropi rendah (minimal 8 karakter unik)."
+  fi
+}
 
 preflight() {
   command -v gcloud >/dev/null 2>&1 || die "gcloud CLI tidak ditemukan."
@@ -119,10 +150,10 @@ ensure_service_account() {
 }
 
 read_api_key() {
-  # urutan: variabel GOOGLE_API_KEY -> berkas .env -> input tersembunyi
+  # urutan: variabel GOOGLE_API_KEY -> berkas .env -> input tersembunyi (tanpa pernah mencetak nilai secret)
   local v="${GOOGLE_API_KEY:-}"
-  if [[ -z "$v" && -f .env ]]; then
-    v="$(grep -E '^GOOGLE_API_KEY=' .env | head -n1 | cut -d= -f2- | tr -d "\r\"'" || true)"
+  if [[ -z "$v" ]]; then
+    v="$(read_env_var_from_dotenv "GOOGLE_API_KEY")"
   fi
   if [[ -z "$v" ]]; then
     read -r -s -p "    Masukkan GOOGLE_API_KEY (Gemini): " v; echo >&2
@@ -131,9 +162,44 @@ read_api_key() {
   printf '%s' "$v"
 }
 
+read_jwt_secret() {
+  # urutan: variabel JWT_SECRET_KEY -> berkas .env -> input tersembunyi (tanpa pernah mencetak nilai secret)
+  local v="${JWT_SECRET_KEY:-}"
+  if [[ -z "$v" ]]; then
+    v="$(read_env_var_from_dotenv "JWT_SECRET_KEY")"
+  fi
+  if [[ -z "$v" ]]; then
+    read -r -s -p "    Masukkan JWT_SECRET_KEY (minimal 32 karakter): " v; echo >&2
+  fi
+  validate_jwt_secret_strength "$v"
+  printf '%s' "$v"
+}
+
+read_maps_api_key() {
+  # urutan: variabel GOOGLE_MAPS_API_KEY / GOOGLE_PLACES_API_KEY -> berkas .env -> input tersembunyi
+  local v="${GOOGLE_MAPS_API_KEY:-${GOOGLE_PLACES_API_KEY:-}}"
+  if [[ -z "$v" ]]; then
+    v="$(read_env_var_from_dotenv "GOOGLE_MAPS_API_KEY")"
+  fi
+  if [[ -z "$v" ]]; then
+    v="$(read_env_var_from_dotenv "GOOGLE_PLACES_API_KEY")"
+  fi
+  if [[ -z "$v" ]]; then
+    read -r -s -p "    Masukkan GOOGLE_MAPS_API_KEY (Google Places API): " v; echo >&2
+  fi
+  [[ -n "$v" ]] || die "GOOGLE_MAPS_API_KEY kosong. Endpoint /api/hospitals/nearby membutuhkan kunci Google Places."
+  printf '%s' "$v"
+}
+
+grant_secret_access() {
+  local sec_name="$1"
+  gcloud secrets add-iam-policy-binding "$sec_name" --project "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --quiet >/dev/null 2>&1 || true
+}
+
 ensure_secret() {
   local force="${1:-0}"
-  info "Memastikan secret '$SECRET_NAME'"
+  info "Memastikan secret '$SECRET_NAME' (GOOGLE_API_KEY)"
   if gcloud secrets describe "$SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
     if [[ "$force" == "1" ]]; then
       read_api_key | gcloud secrets versions add "$SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
@@ -146,12 +212,67 @@ ensure_secret() {
       --replication-policy=automatic --data-file=- >/dev/null
     ok "dibuat"
   fi
+  grant_secret_access "$SECRET_NAME"
+}
+
+ensure_jwt_secret() {
+  local force="${1:-0}"
+  info "Memastikan secret '$JWT_SECRET_NAME' (JWT_SECRET_KEY)"
+  if gcloud secrets describe "$JWT_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    if [[ "$force" == "1" ]]; then
+      read_jwt_secret | gcloud secrets versions add "$JWT_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+      ok "versi baru ditambahkan"
+    else
+      # Validasi nilai yang sudah ada di Secret Manager agar aplikasi tidak gagal startup di Cloud Run
+      local existing_jwt
+      existing_jwt="$(gcloud secrets versions access latest --secret="$JWT_SECRET_NAME" --project "$PROJECT_ID" 2>/dev/null || true)"
+      if [[ -z "$existing_jwt" ]] || (( ${#existing_jwt} < 32 )); then
+        warn "Secret '$JWT_SECRET_NAME' di Secret Manager kosong atau kurang dari 32 karakter; memperbarui..."
+        read_jwt_secret | gcloud secrets versions add "$JWT_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+        ok "versi valid baru ditambahkan"
+      else
+        validate_jwt_secret_strength "$existing_jwt"
+        ok "sudah ada dan memenuhi syarat keamanan (pakai './deploy.sh jwt-secret' untuk memperbarui)"
+      fi
+    fi
+  else
+    read_jwt_secret | gcloud secrets create "$JWT_SECRET_NAME" --project "$PROJECT_ID" \
+      --replication-policy=automatic --data-file=- >/dev/null
+    ok "dibuat"
+  fi
+  grant_secret_access "$JWT_SECRET_NAME"
+}
+
+ensure_maps_secret() {
+  local force="${1:-0}"
+  info "Memastikan secret '$MAPS_SECRET_NAME' (GOOGLE_MAPS_API_KEY)"
+  if gcloud secrets describe "$MAPS_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    if [[ "$force" == "1" ]]; then
+      read_maps_api_key | gcloud secrets versions add "$MAPS_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+      ok "versi baru ditambahkan"
+    else
+      local existing_maps
+      existing_maps="$(gcloud secrets versions access latest --secret="$MAPS_SECRET_NAME" --project "$PROJECT_ID" 2>/dev/null || true)"
+      if [[ -z "$existing_maps" ]]; then
+        warn "Secret '$MAPS_SECRET_NAME' kosong; memperbarui..."
+        read_maps_api_key | gcloud secrets versions add "$MAPS_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+        ok "versi baru ditambahkan"
+      else
+        ok "sudah ada (pakai './deploy.sh maps-secret' untuk memperbarui isinya)"
+      fi
+    fi
+  else
+    read_maps_api_key | gcloud secrets create "$MAPS_SECRET_NAME" --project "$PROJECT_ID" \
+      --replication-policy=automatic --data-file=- >/dev/null
+    ok "dibuat"
+  fi
+  grant_secret_access "$MAPS_SECRET_NAME"
 }
 
 find_firebase_json() {
   local f=""
   if [[ -f .env ]]; then
-    f="$(grep -E '^FIREBASE_PATH=' .env | head -n1 | cut -d= -f2- | tr -d "\r\"'" || true)"
+    f="$(read_env_var_from_dotenv "FIREBASE_PATH")"
   fi
   if [[ -n "$f" && -f "$f" ]]; then
     printf '%s' "$f"
@@ -188,9 +309,17 @@ ensure_firebase_secret() {
     ok "dibuat dari $json_file"
   fi
 
-  # Berikan izin ke service account Cloud Run
-  gcloud secrets add-iam-policy-binding "$FIREBASE_SECRET_NAME" --project "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --quiet >/dev/null 2>&1 || true
+  grant_secret_access "$FIREBASE_SECRET_NAME"
+}
+
+verify_required_secrets_ready() {
+  info "Memverifikasi ketersediaan seluruh secret wajib sebelum build & deploy"
+  local s
+  for s in "$SECRET_NAME" "$JWT_SECRET_NAME" "$MAPS_SECRET_NAME" "$FIREBASE_SECRET_NAME"; do
+    gcloud secrets describe "$s" --project "$PROJECT_ID" >/dev/null 2>&1 \
+      || die "Secret wajib '$s' belum tersedia di Secret Manager."
+  done
+  ok "Seluruh secret wajib ($SECRET_NAME, $JWT_SECRET_NAME, $MAPS_SECRET_NAME, $FIREBASE_SECRET_NAME) siap"
 }
 
 build_image() {
@@ -219,7 +348,7 @@ deploy_service() {
     --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" \
     --timeout "$TIMEOUT" \
     --no-cpu-throttling --cpu-boost \
-    --set-secrets "GOOGLE_API_KEY=${SECRET_NAME}:latest,/secrets/firebase/key.json=${FIREBASE_SECRET_NAME}:latest" \
+    --set-secrets "GOOGLE_API_KEY=${SECRET_NAME}:latest,JWT_SECRET_KEY=${JWT_SECRET_NAME}:latest,GOOGLE_MAPS_API_KEY=${MAPS_SECRET_NAME}:latest,/secrets/firebase/key.json=${FIREBASE_SECRET_NAME}:latest" \
     --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=FALSE,FIREBASE_PATH=/secrets/firebase/key.json,GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase/key.json,FIREBASE_PROJECT_ID=flutter-agent-doctor" \
     --quiet
   ok "revisi baru aktif"
@@ -242,7 +371,14 @@ health_check() {
   printf '\n\033[1;32mSelesai.\033[0m\n'
   echo "  URL layanan : $url"
   echo "  Dokumentasi : ${url}/docs"
-  echo "  Di Flutter  : ubah baseUrl di lib/constants.dart menjadi  ${url}/api"
+  echo "  Di Flutter  : ubah baseUrl di lib/constants.dart menjadi ${url}"
+}
+
+refresh_service_secrets() {
+  info "Memulai revisi baru agar secret terbaru terbaca"
+  gcloud run services update "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
+    --update-env-vars "SECRET_REFRESHED_AT=$(date +%s)" --quiet >/dev/null
+  ok "selesai"
 }
 
 fix_permissions() {
@@ -266,7 +402,10 @@ case "$cmd" in
     ensure_repo
     ensure_service_account
     ensure_secret 0
+    ensure_jwt_secret 0
+    ensure_maps_secret 0
     ensure_firebase_secret 0
+    verify_required_secrets_ready
     build_image
     deploy_service
     health_check
@@ -274,18 +413,22 @@ case "$cmd" in
   secret)
     preflight
     ensure_secret 1
-    info "Memulai revisi baru agar secret terbaru terbaca"
-    gcloud run services update "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
-      --update-env-vars "SECRET_REFRESHED_AT=$(date +%s)" --quiet >/dev/null
-    ok "selesai"
+    refresh_service_secrets
+    ;;
+  jwt-secret)
+    preflight
+    ensure_jwt_secret 1
+    refresh_service_secrets
+    ;;
+  maps-secret)
+    preflight
+    ensure_maps_secret 1
+    refresh_service_secrets
     ;;
   firebase-secret)
     preflight
     ensure_firebase_secret 1
-    info "Memulai revisi baru agar secret Firebase terbaru terbaca"
-    gcloud run services update "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
-      --update-env-vars "SECRET_REFRESHED_AT=$(date +%s)" --quiet >/dev/null
-    ok "selesai"
+    refresh_service_secrets
     ;;
   url)
     preflight >/dev/null
@@ -311,7 +454,7 @@ case "$cmd" in
     fix_permissions
     ;;
   help|-h|--help)
-    sed -n '2,22p' "$0"
+    sed -n '2,24p' "$0"
     ;;
   *)
     die "Perintah tidak dikenal: $cmd  (coba: ./deploy.sh help)"
