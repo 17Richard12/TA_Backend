@@ -163,18 +163,41 @@ def _find_docs_by_user(user_uid: str):
 
 
 def _save_message(session_doc_id: str, role: str, response: str):
-    """Simpan satu pesan ke subcollection messages."""
+    """Simpan satu pesan ke subcollection messages dan perbarui metadata tanggal sesi."""
     msg_id = _new_id()
-    db.collection(CHATS_COL).document(session_doc_id) \
-        .collection(MESSAGES_COL).document(msg_id).set({
-            "role": role,        # "user" atau "ai"
-            "response": response,
-            "timestamp": _now(),
-        })
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    jakarta_tz = timezone(timedelta(hours=7)) if "timedelta" in globals() else timezone.utc
+    try:
+        from datetime import timedelta as _td
+        jakarta_tz = timezone(_td(hours=7))
+    except Exception:
+        pass
+    date_wib = now_utc.astimezone(jakarta_tz).strftime("%Y-%m-%d")
+
+    session_ref = db.collection(CHATS_COL).document(session_doc_id)
+    session_ref.collection(MESSAGES_COL).document(msg_id).set({
+        "role": role,        # "user" atau "ai"
+        "response": response,
+        "timestamp": now_iso,
+        "date_wib": date_wib,
+    })
+    try:
+        meta_update: Dict[str, Any] = {
+            "last_message_date_wib": date_wib,
+            "updated_at": now_iso,
+        }
+        if role == "user":
+            meta_update["last_user_message_date_wib"] = date_wib
+        session_ref.set(meta_update, merge=True)
+    except Exception:
+        pass
 
 
 def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: bool, first_message: str = "") -> str:
     """Return doc_id session. Buat baru jika belum ada."""
+    from datetime import timedelta as _td
+    date_wib = datetime.now(timezone(_td(hours=7))).strftime("%Y-%m-%d")
     if is_new_session:
         doc_id = _new_id()
         title = _generate_title(first_message) if first_message else "Konsultasi Kesehatan"
@@ -182,6 +205,8 @@ def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: b
             "user": user_uid,
             "sessionID": session_id,
             "title": title,
+            "created_date_wib": date_wib,
+            "last_message_date_wib": date_wib,
         })
         return doc_id
     else:
@@ -199,6 +224,8 @@ def _get_or_create_session_doc(session_id: str, user_uid: str, is_new_session: b
             "user": user_uid,
             "sessionID": session_id,
             "title": title,
+            "created_date_wib": date_wib,
+            "last_message_date_wib": date_wib,
         })
         return doc_id
 

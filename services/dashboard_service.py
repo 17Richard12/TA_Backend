@@ -1,11 +1,16 @@
+from collections import OrderedDict
 import hashlib
 import inspect
 import json
 import os
 import re
+import threading
+import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import google.generativeai as genai
+from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from config.firebase import db
 from schemas.smoke_schema import normalize_smoke_date_str
@@ -19,9 +24,17 @@ DAILY_SUMMARIES_COL = "dailyAiSummaries"
 DASHBOARD_SUMMARY_MODEL = os.getenv("MEDICAL_ANALYSIS_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SECONDS = float(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS", "15"))
 FORCE_REFRESH_COOLDOWN_SECONDS = int(os.getenv("AI_SUMMARY_REFRESH_COOLDOWN_SECONDS", "300"))
+FALLBACK_RETRY_SECONDS = int(os.getenv("AI_SUMMARY_FALLBACK_RETRY_SECONDS", "300"))
+GENERATION_LEASE_SECONDS = float(os.getenv("AI_SUMMARY_LEASE_SECONDS", "20"))
+LEASE_WAIT_TIMEOUT_SECONDS = float(os.getenv("AI_SUMMARY_LEASE_WAIT_SECONDS", "3.0"))
+LEASE_POLL_INTERVAL_SECONDS = float(os.getenv("AI_SUMMARY_LEASE_POLL_SECONDS", "0.05"))
+MAX_LOCAL_COORDINATION_ENTRIES = 128
 
-# In-memory fallback tracker for per-user force_refresh cooldown
-_RECENT_GENERATION_TS: Dict[Tuple[str, str, str], datetime] = {}
+# Process-local reentrant mutex for thread-safe lease coordination and bounded fallback cache
+_LEASE_MUTEX = threading.RLock()
+# Bounded LRU/TTL fallback tracker keyed by (user_id, yesterday_date) -> (data_signature, generated_dt)
+# Primary coordination and cooldown state is stored in Firestore (dailyAiSummaries/{user_id}_{yesterday_date}).
+_RECENT_GENERATION_TS: "OrderedDict[Tuple[str, str], Tuple[str, datetime]]" = OrderedDict()
 
 _PROMPT_INJECTION_PATTERNS = re.compile(
     r"(?i)\b("
@@ -295,6 +308,16 @@ def _sanitize_untrusted_text(raw: Any, max_len: int = 120) -> str:
     return text
 
 
+def _compute_all_messages_fingerprint(message_hashes: List[str]) -> str:
+    """
+    Menghasilkan SHA-256 deterministik atas seluruh pesan chat pasien pada tanggal terkait
+    tanpa bergantung pada urutan query Firestore dan tanpa menyimpan teks mentah.
+    """
+    sorted_hashes = sorted(str(h) for h in (message_hashes or []) if h)
+    canonical = json.dumps(sorted_hashes, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _compute_yesterday_data_signature(
     yesterday_date: str,
     smoke_recorded: bool,
@@ -307,13 +330,23 @@ def _compute_yesterday_data_signature(
     medical_history: str,
     chat_sessions_total: int,
     chat_messages_total: int,
-    chat_topics: List[str],
+    chat_topics: Optional[List[str]] = None,
+    chat_messages_fingerprint: Optional[str] = None,
 ) -> str:
     """
     Menghasilkan tanda tangan deterministik SHA-256 dari seluruh data input yang telah dinormalisasi.
     Perubahan pada jumlah rokok, log jam merokok, nama/status aktivitas, riwayat medis,
-    atau sesi/topik chat akan menghasilkan signature baru dan membatalkan cache lama.
+    atau pesan chat ke-1 hingga ke-N akan menghasilkan signature baru dan membatalkan cache lama.
+    Teks mentah pesan chat tidak pernah disimpan di dalam signature maupun dokumen cache.
     """
+    if not chat_messages_fingerprint:
+        fallback_hashes = [
+            hashlib.sha256(_sanitize_untrusted_text(t, max_len=1000).lower().encode("utf-8")).hexdigest()
+            for t in (chat_topics or [])
+            if str(t).strip()
+        ]
+        chat_messages_fingerprint = _compute_all_messages_fingerprint(fallback_hashes)
+
     normalized_payload = {
         "yesterday_date": str(yesterday_date).strip(),
         "smoke_recorded": bool(smoke_recorded),
@@ -338,11 +371,7 @@ def _compute_yesterday_data_signature(
         "medical_history": _sanitize_untrusted_text(medical_history, max_len=200).lower(),
         "chat_sessions_total": int(chat_sessions_total),
         "chat_messages_total": int(chat_messages_total),
-        "chat_topics": [
-            _sanitize_untrusted_text(t, max_len=120).lower()
-            for t in (chat_topics or [])
-            if str(t).strip()
-        ],
+        "chat_messages_fingerprint": str(chat_messages_fingerprint),
     }
     canonical_json = json.dumps(
         normalized_payload,
@@ -442,6 +471,73 @@ def _call_gemini_with_timeout(model: Any, prompt: str) -> Any:
     return model.generate_content(prompt)
 
 
+def _parse_iso_to_jakarta_dt(ts_raw: Any) -> Optional[datetime]:
+    if not isinstance(ts_raw, str) or not ts_raw.strip():
+        return None
+    try:
+        parsed_dt = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=JAKARTA_TZ)
+        return parsed_dt.astimezone(JAKARTA_TZ)
+    except Exception:
+        return None
+
+
+def _prune_local_generation_cache(now_dt: datetime) -> None:
+    """
+    Membersihkan entri kedaluwarsa dan membatasi ukuran maksimum cache lokal di memori
+    agar tidak pernah tumbuh tanpa batas pada instance Cloud Run yang berjalan lama.
+    """
+    max_ttl = max(FORCE_REFRESH_COOLDOWN_SECONDS, FALLBACK_RETRY_SECONDS, 60)
+    expired_keys = []
+    for k, val in list(_RECENT_GENERATION_TS.items()):
+        ts_dt = val[1] if isinstance(val, tuple) and len(val) == 2 else val
+        if isinstance(ts_dt, datetime) and (now_dt - ts_dt).total_seconds() >= max_ttl:
+            expired_keys.append(k)
+    for k in expired_keys:
+        _RECENT_GENERATION_TS.pop(k, None)
+
+    while len(_RECENT_GENERATION_TS) > MAX_LOCAL_COORDINATION_ENTRIES:
+        _RECENT_GENERATION_TS.popitem(last=False)
+
+
+def _record_local_generation_ts(
+    user_id: str,
+    yesterday_date: str,
+    data_signature: str,
+    now_dt: datetime,
+) -> None:
+    with _LEASE_MUTEX:
+        _prune_local_generation_cache(now_dt)
+        key = (user_id, yesterday_date)
+        # Mengganti signature lama untuk (user_id, yesterday_date) sehingga entri usang langsung terhapus
+        _RECENT_GENERATION_TS.pop(key, None)
+        _RECENT_GENERATION_TS[key] = (data_signature, now_dt)
+        while len(_RECENT_GENERATION_TS) > MAX_LOCAL_COORDINATION_ENTRIES:
+            _RECENT_GENERATION_TS.popitem(last=False)
+
+
+def _get_local_generation_ts(
+    user_id: str,
+    yesterday_date: str,
+    data_signature: str,
+    now_dt: datetime,
+) -> Optional[datetime]:
+    with _LEASE_MUTEX:
+        _prune_local_generation_cache(now_dt)
+        entry = _RECENT_GENERATION_TS.get((user_id, yesterday_date))
+        if isinstance(entry, tuple) and len(entry) == 2:
+            sig, dt_val = entry
+            if sig == data_signature:
+                return dt_val
+            return None
+        # Backward compatibility if a test manually wrote (user_id, yesterday_date, data_signature)
+        legacy_val = _RECENT_GENERATION_TS.get((user_id, yesterday_date, data_signature))  # type: ignore[arg-type]
+        if isinstance(legacy_val, datetime):
+            return legacy_val
+        return None
+
+
 def _check_refresh_cooldown(
     user_id: str,
     yesterday_date: str,
@@ -453,22 +549,16 @@ def _check_refresh_cooldown(
     Memeriksa apakah permintaan force_refresh dengan data_signature yang sama
     masih berada dalam masa jeda (cooldown) per pengguna.
     """
-    if FORCE_REFRESH_COOLDOWN_SECONDS <= 0:
+    cooldown_sec = int(os.getenv("AI_SUMMARY_REFRESH_COOLDOWN_SECONDS", str(FORCE_REFRESH_COOLDOWN_SECONDS)))
+    if cooldown_sec <= 0:
         return False, 0
 
     last_dt: Optional[datetime] = None
     if cached_dict and cached_dict.get("data_signature") == data_signature:
         ts_raw = cached_dict.get("last_generated_at") or cached_dict.get("updated_at")
-        if isinstance(ts_raw, str) and ts_raw.strip():
-            try:
-                parsed_dt = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
-                if parsed_dt.tzinfo is None:
-                    parsed_dt = parsed_dt.replace(tzinfo=JAKARTA_TZ)
-                last_dt = parsed_dt.astimezone(JAKARTA_TZ)
-            except Exception:
-                pass
+        last_dt = _parse_iso_to_jakarta_dt(ts_raw)
 
-    mem_dt = _RECENT_GENERATION_TS.get((user_id, yesterday_date, data_signature))
+    mem_dt = _get_local_generation_ts(user_id, yesterday_date, data_signature, now_dt)
     if mem_dt and (last_dt is None or mem_dt > last_dt):
         last_dt = mem_dt
 
@@ -476,10 +566,341 @@ def _check_refresh_cooldown(
         return False, 0
 
     elapsed = (now_dt - last_dt).total_seconds()
-    if 0 <= elapsed < FORCE_REFRESH_COOLDOWN_SECONDS:
-        remaining = max(1, int(FORCE_REFRESH_COOLDOWN_SECONDS - elapsed))
+    if 0 <= elapsed < cooldown_sec:
+        remaining = max(1, int(cooldown_sec - elapsed))
         return True, remaining
     return False, 0
+
+
+def _is_fallback_cache_expired(
+    cached_dict: Optional[Dict[str, Any]],
+    now_dt: datetime,
+) -> bool:
+    """
+    Memeriksa apakah hasil fallback yang tersimpan di cache sudah melewati masa
+    AI_SUMMARY_FALLBACK_RETRY_SECONDS sehingga berhak dicoba kembali ke Gemini.
+    """
+    if not cached_dict:
+        return True
+    retry_sec = int(os.getenv("AI_SUMMARY_FALLBACK_RETRY_SECONDS", str(FALLBACK_RETRY_SECONDS)))
+    if retry_sec <= 0:
+        return True
+    ts_raw = cached_dict.get("last_generated_at") or cached_dict.get("updated_at")
+    last_dt = _parse_iso_to_jakarta_dt(ts_raw)
+    if last_dt is None:
+        return True
+    elapsed = (now_dt - last_dt).total_seconds()
+    return elapsed >= retry_sec
+
+
+def _evaluate_cached_summary(
+    user_id: str,
+    yesterday_date: str,
+    data_signature: str,
+    cached_dict: Optional[Dict[str, Any]],
+    force_refresh: bool,
+    now_dt: datetime,
+    has_api_key: bool,
+) -> Tuple[bool, bool, int]:
+    """
+    Menentukan apakah dokumen cache saat ini dapat langsung dikembalikan:
+    Returns: (use_cache, is_rate_limited, cooldown_remaining_seconds)
+    """
+    if (
+        not cached_dict
+        or cached_dict.get("data_signature") != data_signature
+        or not cached_dict.get("summary")
+        or not cached_dict.get("feedback")
+    ):
+        return False, False, 0
+
+    origin_source = str(
+        cached_dict.get("analysis_source")
+        or cached_dict.get("source")
+        or "fallback"
+    )
+    if origin_source not in ("gemini", "fallback"):
+        origin_source = "fallback"
+
+    if force_refresh:
+        is_throttled, cooldown_remaining = _check_refresh_cooldown(
+            user_id=user_id,
+            yesterday_date=yesterday_date,
+            data_signature=data_signature,
+            cached_dict=cached_dict,
+            now_dt=now_dt,
+        )
+        if is_throttled:
+            return True, True, cooldown_remaining
+        return False, False, 0
+
+    if origin_source == "gemini":
+        return True, False, 0
+
+    # origin_source == "fallback": jika tidak ada API key atau belum melewati masa retry, gunakan cache
+    if not has_api_key:
+        return True, False, 0
+    if not _is_fallback_cache_expired(cached_dict, now_dt):
+        return True, False, 0
+
+    # Masa fallback retry telah habis -> izinkan 1 percobaan ulang terkoordinasi ke Gemini
+    return False, False, 0
+
+
+def _try_acquire_generation_lease(
+    summary_doc_ref: Any,
+    user_id: str,
+    yesterday_date: str,
+    data_signature: str,
+    force_refresh: bool,
+    now_dt: datetime,
+    has_api_key: bool,
+) -> Tuple[str, str, Optional[Dict[str, Any]], bool, int]:
+    """
+    Mencoba mengambil lease pembuatan analisa AI secara atomik di Firestore.
+    Tidak memanggil Gemini di dalam transaksi.
+    Returns: (status, lease_owner, current_doc_dict, is_rate_limited, cooldown_remaining)
+      status in {"cache_ready", "lease_held", "acquired"}
+    """
+    lease_sec = float(os.getenv("AI_SUMMARY_LEASE_SECONDS", str(GENERATION_LEASE_SECONDS)))
+    lease_owner = uuid.uuid4().hex
+    lease_expires_iso = (now_dt + timedelta(seconds=lease_sec)).isoformat()
+    lease_payload = {
+        "userID": user_id,
+        "yesterday_date": yesterday_date,
+        "generation_status": "in_progress",
+        "lease_owner": lease_owner,
+        "lease_signature": data_signature,
+        "lease_acquired_at": now_dt.isoformat(),
+        "lease_expires_at": lease_expires_iso,
+    }
+
+    def _inspect_and_decide(curr: Optional[Dict[str, Any]]) -> Tuple[str, bool, int]:
+        use_cache, is_throttled, cooldown_rem = _evaluate_cached_summary(
+            user_id=user_id,
+            yesterday_date=yesterday_date,
+            data_signature=data_signature,
+            cached_dict=curr,
+            force_refresh=force_refresh,
+            now_dt=now_dt,
+            has_api_key=has_api_key,
+        )
+        if use_cache:
+            return "cache_ready", is_throttled, cooldown_rem
+
+        if curr and curr.get("generation_status") == "in_progress" and curr.get("lease_signature") == data_signature:
+            lease_exp_dt = _parse_iso_to_jakarta_dt(curr.get("lease_expires_at"))
+            if lease_exp_dt is not None and lease_exp_dt > now_dt:
+                return "lease_held", False, 0
+
+        return "acquired", False, 0
+
+    with _LEASE_MUTEX:
+        try:
+            # Gunakan transaksi Firestore jika client mendukung db.transaction()
+            if hasattr(db, "transaction") and callable(getattr(db, "transaction", None)):
+                transaction = db.transaction()
+
+                @firestore.transactional
+                def _txn_acquire(txn):
+                    snap = summary_doc_ref.get(transaction=txn)
+                    curr = (snap.to_dict() or {}) if snap.exists else None
+                    decision, throttled, rem = _inspect_and_decide(curr)
+                    if decision == "acquired":
+                        txn.set(summary_doc_ref, lease_payload, merge=True)
+                    return decision, curr, throttled, rem
+
+                decision, curr_doc, throttled, rem = _txn_acquire(transaction)
+                return decision, (lease_owner if decision == "acquired" else ""), curr_doc, throttled, rem
+        except Exception:
+            pass
+
+        # Fallback atomik dengan _LEASE_MUTEX (untuk MockFirestoreDB atau jika transaksi gagal)
+        try:
+            snap = summary_doc_ref.get()
+            curr_doc = (snap.to_dict() or {}) if snap.exists else None
+            decision, throttled, rem = _inspect_and_decide(curr_doc)
+            if decision == "acquired":
+                summary_doc_ref.set(lease_payload, merge=True)
+            return decision, (lease_owner if decision == "acquired" else ""), curr_doc, throttled, rem
+        except Exception:
+            return "acquired", lease_owner, None, False, 0
+
+
+def _finalize_generation_lease(
+    summary_doc_ref: Any,
+    user_id: str,
+    yesterday_date: str,
+    data_signature: str,
+    lease_owner: str,
+    summary_text: str,
+    feedback_text: str,
+    source_type: str,
+    generated_iso: str,
+) -> Tuple[str, str, str]:
+    """
+    Menyimpan hasil akhir analisa AI ke Firestore secara aman:
+    - Mencegah penimpaan jika data pasien berubah (signature baru) saat Gemini sedang berjalan.
+    - Mencegah penimpaan hasil Gemini yang sudah berhasil dengan hasil fallback yang usang.
+    Returns: (final_summary, final_feedback, final_source_type)
+    """
+    with _LEASE_MUTEX:
+        try:
+            snap = summary_doc_ref.get()
+            curr = (snap.to_dict() or {}) if snap.exists else {}
+
+            # 1. Jika selama proses generasi ada request dengan signature data baru yang sudah masuk,
+            # jangan timpa dokumen Firestore milik signature yang lebih baru.
+            curr_lease_sig = curr.get("lease_signature")
+            curr_data_sig = curr.get("data_signature")
+            if curr_lease_sig and curr_lease_sig != data_signature:
+                return summary_text, feedback_text, source_type
+            if (
+                curr_data_sig
+                and curr_data_sig != data_signature
+                and curr.get("lease_owner") not in (None, "", lease_owner)
+            ):
+                return summary_text, feedback_text, source_type
+
+            # 2. Jangan pernah menimpa hasil Gemini yang sudah valid untuk signature yang sama dengan fallback!
+            if (
+                source_type == "fallback"
+                and curr_data_sig == data_signature
+                and (curr.get("analysis_source") == "gemini" or curr.get("source") == "gemini")
+                and curr.get("summary")
+                and curr.get("feedback")
+            ):
+                summary_doc_ref.set(
+                    {
+                        "generation_status": "ready",
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    },
+                    merge=True,
+                )
+                return str(curr["summary"]), str(curr["feedback"]), "gemini"
+
+            summary_doc_ref.set(
+                {
+                    "userID": user_id,
+                    "yesterday_date": yesterday_date,
+                    "data_signature": data_signature,
+                    "summary": summary_text,
+                    "feedback": feedback_text,
+                    "source": source_type,
+                    "analysis_source": source_type,
+                    "ai_generated": source_type == "gemini",
+                    "generation_status": "ready",
+                    "lease_owner": None,
+                    "lease_signature": data_signature,
+                    "lease_expires_at": None,
+                    "last_generated_at": generated_iso,
+                    "updated_at": generated_iso,
+                },
+                merge=True,
+            )
+        except Exception:
+            pass
+
+    return summary_text, feedback_text, source_type
+
+
+def _collect_yesterday_chat_data(
+    user_id: str,
+    yesterday_date: str,
+) -> Tuple[int, int, List[str], str]:
+    """
+    Mengambil statistik dan sidik jari (fingerprint) pesan chat pasien pada yesterday_date secara efisien:
+    1. Melewati subkoleksi messages untuk sesi chat yang memiliki metadata tanggal di luar yesterday_date.
+    2. Menggunakan filter rentang timestamp terindeks pada subkoleksi messages untuk membatasi dokumen yang dibaca.
+    3. Menghitung SHA-256 fingerprint deterministik dari SELURUH pesan user pada yesterday_date
+       (bukan hanya 3 sampel pertama) tanpa menyimpan pesan mentah di dalam signature.
+    """
+    chat_sessions_total = 0
+    chat_messages_total = 0
+    all_message_hashes: List[str] = []
+    candidate_snippets: List[Tuple[str, str, str, str]] = []
+
+    yesterday_dt = datetime.strptime(yesterday_date, "%Y-%m-%d")
+    prev_day_str = (yesterday_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Rentang ISO mencakup baik timestamp UTC (mulai H-1 17:00 UTC) maupun WIB (+07:00) dan YYYY-MM-DD
+    window_start_iso = f"{prev_day_str}T17:00:00"
+    window_end_iso = f"{yesterday_date}\uffff"
+
+    chat_docs = list(
+        db.collection(CHATS_COL)
+        .where(filter=FieldFilter("user", "==", user_id))
+        .stream()
+    )
+
+    for chat in chat_docs:
+        chat_meta = chat.to_dict() or {}
+        # Optimasi level sesi: lewati sesi yang dibuat setelah yesterday_date atau terakhir aktif sebelum yesterday_date
+        created_wib = str(chat_meta.get("created_date_wib") or "").strip()
+        if len(created_wib) == 10 and created_wib > yesterday_date:
+            continue
+
+        last_user_wib = str(chat_meta.get("last_user_message_date_wib") or "").strip()
+        last_msg_wib = str(chat_meta.get("last_message_date_wib") or "").strip()
+        if len(last_user_wib) == 10 and last_user_wib < yesterday_date:
+            continue
+        if not last_user_wib and len(last_msg_wib) == 10 and last_msg_wib < yesterday_date:
+            continue
+
+        msgs_col = chat.reference.collection("messages")
+        try:
+            # Query terindeks single-field pada timestamp untuk menghindari pembacaan seluruh riwayat pesan
+            msgs = list(
+                msgs_col
+                .where(filter=FieldFilter("timestamp", ">=", window_start_iso))
+                .where(filter=FieldFilter("timestamp", "<=", window_end_iso))
+                .stream()
+            )
+        except Exception:
+            msgs = list(
+                msgs_col
+                .where(filter=FieldFilter("role", "==", "user"))
+                .stream()
+            )
+
+        session_msg_count = 0
+        for m in msgs:
+            d = m.to_dict() or {}
+            if d.get("role") != "user":
+                continue
+            msg_date = d.get("date_wib") or _parse_timestamp_to_jakarta_date_str(d.get("timestamp"))
+            if msg_date != yesterday_date:
+                continue
+
+            session_msg_count += 1
+            chat_messages_total += 1
+            raw_msg = (
+                d.get("content")
+                or d.get("text")
+                or d.get("message")
+                or d.get("response")
+                or ""
+            )
+            normalized_for_hash = _sanitize_untrusted_text(raw_msg, max_len=1000).lower()
+            msg_hash = hashlib.sha256(
+                f"{chat.id}:{m.id}:{normalized_for_hash}".encode("utf-8")
+            ).hexdigest()
+            all_message_hashes.append(msg_hash)
+
+            sanitized_snippet = _sanitize_untrusted_text(raw_msg, max_len=120)
+            if sanitized_snippet:
+                ts_sort_key = str(d.get("timestamp") or "")
+                candidate_snippets.append((ts_sort_key, str(chat.id), str(m.id), sanitized_snippet))
+
+        if session_msg_count > 0:
+            chat_sessions_total += 1
+
+    # Urutkan kandidat secara deterministik sebelum mengambil maksimal 3 topik untuk prompt Gemini
+    candidate_snippets.sort(key=lambda item: (item[0], item[1], item[2]))
+    sampled_topics = [item[3] for item in candidate_snippets[:3]]
+    all_messages_fingerprint = _compute_all_messages_fingerprint(all_message_hashes)
+
+    return chat_sessions_total, chat_messages_total, sampled_topics, all_messages_fingerprint
 
 
 def _build_fallback_yesterday_summary(
@@ -648,40 +1069,14 @@ def get_yesterday_ai_summary(
         daily_activities_done_total = len(activities_done_list)
         daily_activities_total = daily_activities_done_total + len(activities_pending_list)
 
-        # 3. Data chat konsultasi kemarin (bedakan jumlah sesi konsultasi vs jumlah pesan)
-        chat_sessions_total = 0
-        chat_messages_total = 0
-        chat_topics: List[str] = []
-        chat_docs = list(
-            db.collection(CHATS_COL)
-            .where(filter=FieldFilter("user", "==", user_id))
-            .stream()
-        )
-        for chat in chat_docs:
-            msgs = (
-                chat.reference.collection("messages")
-                .where(filter=FieldFilter("role", "==", "user"))
-                .stream()
-            )
-            session_msg_count = 0
-            for m in msgs:
-                d = m.to_dict() or {}
-                msg_date = _parse_timestamp_to_jakarta_date_str(d.get("timestamp"))
-                if msg_date == yesterday_date:
-                    session_msg_count += 1
-                    chat_messages_total += 1
-                    raw_msg = (
-                        d.get("content")
-                        or d.get("text")
-                        or d.get("message")
-                        or d.get("response")
-                        or ""
-                    )
-                    sanitized_msg = _sanitize_untrusted_text(raw_msg, max_len=120)
-                    if sanitized_msg and len(chat_topics) < 3:
-                        chat_topics.append(sanitized_msg)
-            if session_msg_count > 0:
-                chat_sessions_total += 1
+        # 3. Data chat konsultasi kemarin (bedakan jumlah sesi konsultasi vs jumlah pesan,
+        #    serta hitung fingerprint SHA-256 atas seluruh pesan kemarin)
+        (
+            chat_sessions_total,
+            chat_messages_total,
+            chat_topics,
+            chat_messages_fingerprint,
+        ) = _collect_yesterday_chat_data(user_id, yesterday_date)
 
         # Pertahankan chat_total sebagai alias jumlah pesan untuk kompatibilitas kontrak API
         chat_total = chat_messages_total
@@ -716,45 +1111,158 @@ def get_yesterday_ai_summary(
             chat_sessions_total=chat_sessions_total,
             chat_messages_total=chat_messages_total,
             chat_topics=chat_topics,
+            chat_messages_fingerprint=chat_messages_fingerprint,
         )
         summary_doc_id = f"{user_id}_{yesterday_date}"
+        summary_doc_ref = db.collection(DAILY_SUMMARIES_COL).document(summary_doc_id)
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+        has_api_key = bool(api_key)
 
-        # 5. Cek cache di Firestore dan terapkan rate-limit / cooldown untuk force_refresh
-        cached_dict: Optional[Dict[str, Any]] = None
-        try:
-            cached_doc = db.collection(DAILY_SUMMARIES_COL).document(summary_doc_id).get()
-            if cached_doc.exists:
-                cached_dict = cached_doc.to_dict() or {}
-        except Exception:
-            cached_dict = None
+        def _format_cached_response(
+            doc_dict: Dict[str, Any],
+            is_throttled: bool = False,
+            cooldown_rem: int = 0,
+            in_progress: bool = False,
+        ) -> dict:
+            origin_source = str(
+                doc_dict.get("analysis_source")
+                or doc_dict.get("source")
+                or "fallback"
+            )
+            if origin_source not in ("gemini", "fallback"):
+                origin_source = "fallback"
+            return {
+                "status": "success",
+                "data": {
+                    "yesterday_date": yesterday_date,
+                    "smoke_recorded": smoke_recorded,
+                    "smoke_count_total": smoke_count_total,
+                    "smoke_limit_low": smoke_limit_low,
+                    "smoke_limit_high": smoke_limit_high,
+                    "daily_activities_done_total": daily_activities_done_total,
+                    "daily_activities_total": daily_activities_total,
+                    "activities_done_list": activities_done_list,
+                    "activities_pending_list": activities_pending_list,
+                    "chat_total": chat_total,
+                    "chat_sessions_total": chat_sessions_total,
+                    "chat_messages_total": chat_messages_total,
+                    "peak_smoke_hour": peak_smoke_hour,
+                    "summary": doc_dict.get("summary"),
+                    "feedback": doc_dict.get("feedback"),
+                    "source": "cache",
+                    "analysis_source": origin_source,
+                    "ai_generated": origin_source == "gemini",
+                    "is_fallback": origin_source != "gemini",
+                    "cached": True,
+                    "rate_limited": is_throttled,
+                    "cooldown_remaining_seconds": cooldown_rem,
+                    "generation_in_progress": in_progress,
+                    "data_signature": data_signature,
+                },
+            }
 
-        signature_matches = bool(
-            cached_dict
-            and cached_dict.get("data_signature") == data_signature
-            and cached_dict.get("summary")
-            and cached_dict.get("feedback")
+        # 5. Koordinasi cache, cooldown, fallback expiration, dan lease konkuren berbasis Firestore
+        (
+            lease_status,
+            lease_owner,
+            curr_doc,
+            is_throttled,
+            cooldown_remaining,
+        ) = _try_acquire_generation_lease(
+            summary_doc_ref=summary_doc_ref,
+            user_id=user_id,
+            yesterday_date=yesterday_date,
+            data_signature=data_signature,
+            force_refresh=force_refresh,
+            now_dt=now_dt,
+            has_api_key=has_api_key,
         )
 
-        if signature_matches and cached_dict is not None:
-            is_throttled, cooldown_remaining = (
-                _check_refresh_cooldown(
-                    user_id=user_id,
-                    yesterday_date=yesterday_date,
-                    data_signature=data_signature,
-                    cached_dict=cached_dict,
-                    now_dt=now_dt,
-                )
-                if force_refresh
-                else (False, 0)
+        if lease_status == "cache_ready" and curr_doc is not None:
+            return _format_cached_response(
+                curr_doc,
+                is_throttled=is_throttled,
+                cooldown_rem=cooldown_remaining,
             )
-            if not force_refresh or is_throttled:
-                origin_source = str(
-                    cached_dict.get("analysis_source")
-                    or cached_dict.get("source")
-                    or "fallback"
+
+        if lease_status == "lease_held":
+            # Request lain sedang memproses signature yang sama; tunggu singkat hingga selesai
+            wait_timeout = float(os.getenv("AI_SUMMARY_LEASE_WAIT_SECONDS", str(LEASE_WAIT_TIMEOUT_SECONDS)))
+            poll_interval = float(os.getenv("AI_SUMMARY_LEASE_POLL_SECONDS", str(LEASE_POLL_INTERVAL_SECONDS)))
+            deadline = time.monotonic() + max(0.0, wait_timeout)
+            latest_doc = curr_doc
+
+            while time.monotonic() < deadline:
+                time.sleep(max(0.01, poll_interval))
+                try:
+                    snap = summary_doc_ref.get()
+                    if snap.exists:
+                        latest_doc = snap.to_dict() or {}
+                        if (
+                            latest_doc.get("data_signature") == data_signature
+                            and latest_doc.get("generation_status") == "ready"
+                            and latest_doc.get("summary")
+                            and latest_doc.get("feedback")
+                        ):
+                            return _format_cached_response(latest_doc)
+
+                        # Jika lease tiba-tiba kedaluwarsa saat menunggu, coba ambil alih lease
+                        lease_exp_dt = _parse_iso_to_jakarta_dt(latest_doc.get("lease_expires_at"))
+                        if lease_exp_dt is not None and lease_exp_dt <= datetime.now(JAKARTA_TZ):
+                            break
+                except Exception:
+                    break
+
+            # Jika lease sudah kedaluwarsa, coba ambil alih satu kali
+            recheck_now = datetime.now(JAKARTA_TZ)
+            (
+                retry_status,
+                retry_owner,
+                retry_doc,
+                retry_throttled,
+                retry_rem,
+            ) = _try_acquire_generation_lease(
+                summary_doc_ref=summary_doc_ref,
+                user_id=user_id,
+                yesterday_date=yesterday_date,
+                data_signature=data_signature,
+                force_refresh=force_refresh,
+                now_dt=recheck_now,
+                has_api_key=has_api_key,
+            )
+            if retry_status == "cache_ready" and retry_doc is not None:
+                return _format_cached_response(
+                    retry_doc,
+                    is_throttled=retry_throttled,
+                    cooldown_rem=retry_rem,
                 )
-                if origin_source not in ("gemini", "fallback"):
-                    origin_source = "fallback"
+            elif retry_status == "acquired":
+                lease_status = "acquired"
+                lease_owner = retry_owner
+            else:
+                # Lease masih aktif dipegang worker lain; kembalikan cache yang ada atau fallback sementara
+                if (
+                    latest_doc
+                    and latest_doc.get("data_signature") == data_signature
+                    and latest_doc.get("summary")
+                    and latest_doc.get("feedback")
+                ):
+                    return _format_cached_response(latest_doc, in_progress=True)
+
+                fb_summary, fb_feedback = _build_fallback_yesterday_summary(
+                    yesterday_date=yesterday_date,
+                    smoke_recorded=smoke_recorded,
+                    smoke_count_total=smoke_count_total,
+                    smoke_limit_low=smoke_limit_low,
+                    smoke_limit_high=smoke_limit_high,
+                    daily_activities_done_total=daily_activities_done_total,
+                    daily_activities_total=daily_activities_total,
+                    activities_done_list=activities_done_list,
+                    activities_pending_list=activities_pending_list,
+                    chat_sessions_total=chat_sessions_total,
+                    chat_messages_total=chat_messages_total,
+                    peak_smoke_hour=peak_smoke_hour,
+                )
                 return {
                     "status": "success",
                     "data": {
@@ -771,20 +1279,22 @@ def get_yesterday_ai_summary(
                         "chat_sessions_total": chat_sessions_total,
                         "chat_messages_total": chat_messages_total,
                         "peak_smoke_hour": peak_smoke_hour,
-                        "summary": cached_dict.get("summary"),
-                        "feedback": cached_dict.get("feedback"),
-                        "source": "cache",
-                        "analysis_source": origin_source,
-                        "ai_generated": origin_source == "gemini",
-                        "is_fallback": origin_source != "gemini",
-                        "cached": True,
-                        "rate_limited": is_throttled,
-                        "cooldown_remaining_seconds": cooldown_remaining,
+                        "summary": fb_summary,
+                        "feedback": fb_feedback,
+                        "source": "fallback",
+                        "analysis_source": "fallback",
+                        "ai_generated": False,
+                        "is_fallback": True,
+                        "cached": False,
+                        "rate_limited": False,
+                        "cooldown_remaining_seconds": 0,
+                        "generation_in_progress": True,
+                        "retry_after_seconds": 5,
                         "data_signature": data_signature,
                     },
                 }
 
-        # 6. Bangun fallback deterministik terlebih dahulu
+        # 6. Bangun fallback deterministik terlebih dahulu (hanya pemegang lease yang sampai di titik ini)
         summary_text, feedback_text = _build_fallback_yesterday_summary(
             yesterday_date=yesterday_date,
             smoke_recorded=smoke_recorded,
@@ -801,9 +1311,8 @@ def get_yesterday_ai_summary(
         )
         source_type = "fallback"
 
-        # 7. Panggil Gemini AI jika GOOGLE_API_KEY tersedia
-        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-        if api_key:
+        # 7. Panggil Gemini AI jika GOOGLE_API_KEY tersedia (di luar transaksi Firestore)
+        if has_api_key:
             try:
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(DASHBOARD_SUMMARY_MODEL)
@@ -862,27 +1371,21 @@ def get_yesterday_ai_summary(
                 # Gunakan fallback deterministik jika Gemini timeout, gagal, atau mengembalikan format tidak valid
                 pass
 
-        # 8. Catat waktu pembuatan & simpan ke cache Firestore
-        generated_iso = now_dt.isoformat()
-        _RECENT_GENERATION_TS[(user_id, yesterday_date, data_signature)] = now_dt
-        try:
-            db.collection(DAILY_SUMMARIES_COL).document(summary_doc_id).set(
-                {
-                    "userID": user_id,
-                    "yesterday_date": yesterday_date,
-                    "data_signature": data_signature,
-                    "summary": summary_text,
-                    "feedback": feedback_text,
-                    "source": source_type,
-                    "analysis_source": source_type,
-                    "ai_generated": source_type == "gemini",
-                    "last_generated_at": generated_iso,
-                    "updated_at": generated_iso,
-                },
-                merge=True,
-            )
-        except Exception:
-            pass
+        # 8. Finalisasi lease & simpan ke cache Firestore dengan perlindungan race condition
+        finish_dt = datetime.now(JAKARTA_TZ)
+        generated_iso = finish_dt.isoformat()
+        _record_local_generation_ts(user_id, yesterday_date, data_signature, finish_dt)
+        summary_text, feedback_text, source_type = _finalize_generation_lease(
+            summary_doc_ref=summary_doc_ref,
+            user_id=user_id,
+            yesterday_date=yesterday_date,
+            data_signature=data_signature,
+            lease_owner=lease_owner,
+            summary_text=summary_text,
+            feedback_text=feedback_text,
+            source_type=source_type,
+            generated_iso=generated_iso,
+        )
 
         return {
             "status": "success",
@@ -909,6 +1412,7 @@ def get_yesterday_ai_summary(
                 "cached": False,
                 "rate_limited": False,
                 "cooldown_remaining_seconds": 0,
+                "generation_in_progress": False,
                 "data_signature": data_signature,
             },
         }

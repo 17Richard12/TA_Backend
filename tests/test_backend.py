@@ -101,6 +101,18 @@ class MockQuery:
                 elif op == "in" and actual not in (val or []):
                     matched = False
                     break
+                elif op == ">=" and (actual is None or str(actual) < str(val)):
+                    matched = False
+                    break
+                elif op == "<=" and (actual is None or str(actual) > str(val)):
+                    matched = False
+                    break
+                elif op == ">" and (actual is None or str(actual) <= str(val)):
+                    matched = False
+                    break
+                elif op == "<" and (actual is None or str(actual) >= str(val)):
+                    matched = False
+                    break
             if matched:
                 results.append(
                     MockDocumentSnapshot(doc_id, data, MockDocumentReference(self._collection, doc_id))
@@ -1093,10 +1105,10 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
             )
         )
 
-        # Simulate Gemini exception on new data change -> falls back cleanly with is_fallback=True
+        # Simulate Gemini exception on new 4th message -> falls back cleanly with is_fallback=True
         chat2.collection("messages").document("m4").set({
             "role": "user",
-            "content": "Pertanyaan tambahan malam hari",
+            "content": "Pertanyaan keempat malam hari tentang dahak",
             "timestamp": "2026-11-08T13:00:00+00:00",
         })
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "dummy-key"}, clear=False):
@@ -1114,6 +1126,276 @@ class TestBackendSecurityAndFeatures(unittest.TestCase):
         self.assertEqual(err_data["analysis_source"], "fallback")
         self.assertFalse(err_data["ai_generated"])
         self.assertTrue(err_data["is_fallback"])
+
+        # Task 1: Editing the 4th message (m4) WITHOUT changing message count (still 4 messages)
+        # or the first 3 sampled topics (m1, m2, m3) MUST invalidate the cache!
+        sig_before_4th_edit = err_data["data_signature"]
+        chat2.collection("messages").document("m4").set({
+            "role": "user",
+            "content": "Pertanyaan keempat yang telah diubah isinya tentang kualitas tidur malam",
+            "timestamp": "2026-11-08T13:00:00+00:00",
+        })
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "dummy-key"}, clear=False):
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                side_effect=fake_generate,
+            ) as mock_gen_4th:
+                resp_4th_edited = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+                self.assertEqual(resp_4th_edited.status_code, 200)
+                data_4th = resp_4th_edited.json()["data"]
+                self.assertEqual(data_4th["chat_messages_total"], 4)
+                self.assertNotEqual(data_4th["data_signature"], sig_before_4th_edit)
+                self.assertFalse(data_4th["cached"])
+                self.assertEqual(data_4th["source"], "gemini")
+                self.assertEqual(mock_gen_4th.call_count, 1)
+
+                # Prompt still only includes at most 3 sampled topics (m1, m2, m3), NOT m4
+                self.assertNotIn("kualitas tidur malam", captured_prompts[-1])
+
+                # Raw chat messages are NEVER stored in the dailyAiSummaries cache document
+                cached_summary_doc = (
+                    self.mock_db.collection("dailyAiSummaries")
+                    .document("patient_1_2026-11-08")
+                    .get()
+                    .to_dict()
+                )
+                serialized_cache_doc = json.dumps(cached_summary_doc)
+                self.assertNotIn("Batuk berdahak ringan", serialized_cache_doc)
+                self.assertNotIn("kualitas tidur malam", serialized_cache_doc)
+
+    # -----------------------------------------------------------------
+    # 11. Concurrency Lease, Fallback Retry Expiration, Query Pruning & Bounded Memory Tests
+    # -----------------------------------------------------------------
+    def test_yesterday_ai_summary_concurrency_fallback_expiration_and_query_optimization(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import timedelta
+        import time
+        from services.dashboard_service import (
+            JAKARTA_TZ,
+            MAX_LOCAL_COORDINATION_ENTRIES,
+            _RECENT_GENERATION_TS,
+            _finalize_generation_lease,
+            _record_local_generation_ts,
+        )
+
+        _RECENT_GENERATION_TS.clear()
+
+        # Seed smoke count for patient_1 on 2026-11-08
+        self.client.post(
+            "/api/smoke-count/",
+            headers=self._headers(self.token_p1),
+            json={"user_id": "patient_1", "timestamp": "2026-11-08", "total": 2},
+        )
+
+        # Task 2: Simultaneous concurrent requests for the same user, date, and signature
+        # must coordinate via the Firestore lease and invoke Gemini ONLY ONCE!
+        class ConcurrentGeminiResponse:
+            text = (
+                '{"summary": "Kemarin Anda mencatat 2 batang rokok dan belum ada aktivitas harian yang selesai.", '
+                '"feedback": "Batas rokok pribadi bukan batas aman medis; mari kurangi lagi rokok hari ini."}'
+            )
+
+        def slow_gemini_generate(prompt, *args, **kwargs):
+            time.sleep(0.12)
+            return ConcurrentGeminiResponse()
+
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_API_KEY": "dummy-key",
+                "AI_SUMMARY_LEASE_WAIT_SECONDS": "2.0",
+                "AI_SUMMARY_LEASE_POLL_SECONDS": "0.02",
+            },
+            clear=False,
+        ):
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                side_effect=slow_gemini_generate,
+            ) as mock_concurrent_gen:
+                def _call_endpoint(_idx: int):
+                    return self.client.get(
+                        "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                        headers=self._headers(self.token_p1),
+                    )
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    responses = list(pool.map(_call_endpoint, range(4)))
+
+                self.assertEqual(mock_concurrent_gen.call_count, 1)
+                for r in responses:
+                    self.assertEqual(r.status_code, 200)
+                    r_data = r.json()["data"]
+                    self.assertEqual(r_data["analysis_source"], "gemini")
+                    self.assertTrue(r_data["ai_generated"])
+                    self.assertIn("2 batang rokok", r_data["summary"])
+
+        # Task 2b: Lease expiration and recovery when a previous Cloud Run instance crashed mid-generation
+        summary_ref = self.mock_db.collection("dailyAiSummaries").document("patient_1_2026-11-08")
+        expired_iso = (datetime.now(JAKARTA_TZ) - timedelta(seconds=30)).isoformat()
+        summary_ref.set({
+            "userID": "patient_1",
+            "yesterday_date": "2026-11-08",
+            "generation_status": "in_progress",
+            "lease_owner": "crashed_worker_123",
+            "lease_signature": responses[0].json()["data"]["data_signature"],
+            "lease_expires_at": expired_iso,
+        })
+        _RECENT_GENERATION_TS.clear()
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "dummy-key"}, clear=False):
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                return_value=ConcurrentGeminiResponse(),
+            ) as mock_recover_gen:
+                rec_resp = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+                self.assertEqual(rec_resp.status_code, 200)
+                self.assertEqual(mock_recover_gen.call_count, 1)
+                self.assertEqual(rec_resp.json()["data"]["source"], "gemini")
+                self.assertEqual(summary_ref.get().to_dict()["generation_status"], "ready")
+
+        # Task 2c / Task 3: _finalize_generation_lease must never overwrite an existing Gemini summary with a fallback
+        sig_now = rec_resp.json()["data"]["data_signature"]
+        final_sum, final_fb, final_src = _finalize_generation_lease(
+            summary_doc_ref=summary_ref,
+            user_id="patient_1",
+            yesterday_date="2026-11-08",
+            data_signature=sig_now,
+            lease_owner="late_fallback_worker",
+            summary_text="Fallback summary usang",
+            feedback_text="Fallback feedback usang",
+            source_type="fallback",
+            generated_iso=datetime.now(JAKARTA_TZ).isoformat(),
+        )
+        self.assertEqual(final_src, "gemini")
+        self.assertNotIn("usang", final_sum)
+        self.assertEqual(summary_ref.get().to_dict()["analysis_source"], "gemini")
+
+        # Task 3: Fallback cache expiration and recovery after AI_SUMMARY_FALLBACK_RETRY_SECONDS
+        summary_ref.delete()
+        _RECENT_GENERATION_TS.clear()
+
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_API_KEY": "dummy-key",
+                "AI_SUMMARY_FALLBACK_RETRY_SECONDS": "300",
+            },
+            clear=False,
+        ):
+            # Step 1: Gemini fails -> fallback is cached
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                side_effect=RuntimeError("Temporary Gemini outage"),
+            ) as mock_fail_gen:
+                fb1 = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+                self.assertEqual(fb1.status_code, 200)
+                self.assertEqual(fb1.json()["data"]["source"], "fallback")
+                self.assertFalse(fb1.json()["data"]["cached"])
+                self.assertEqual(mock_fail_gen.call_count, 1)
+
+                # Step 2: Immediate subsequent request within 300s returns cached fallback without calling Gemini!
+                fb2 = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+                self.assertEqual(fb2.status_code, 200)
+                self.assertEqual(fb2.json()["data"]["source"], "cache")
+                self.assertEqual(fb2.json()["data"]["analysis_source"], "fallback")
+                self.assertTrue(fb2.json()["data"]["cached"])
+                self.assertEqual(mock_fail_gen.call_count, 1)
+
+            # Step 3: Backdate last_generated_at past 300s -> next request retries Gemini and upgrades cache to 'gemini'!
+            old_ts = (datetime.now(JAKARTA_TZ) - timedelta(seconds=360)).isoformat()
+            summary_ref.set({"last_generated_at": old_ts, "updated_at": old_ts}, merge=True)
+
+            with patch(
+                "services.dashboard_service.genai.GenerativeModel.generate_content",
+                return_value=ConcurrentGeminiResponse(),
+            ) as mock_retry_gen:
+                recovered = self.client.get(
+                    "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                    headers=self._headers(self.token_p1),
+                )
+                self.assertEqual(recovered.status_code, 200)
+                rec_data = recovered.json()["data"]
+                self.assertEqual(mock_retry_gen.call_count, 1)
+                self.assertEqual(rec_data["source"], "gemini")
+                self.assertEqual(rec_data["analysis_source"], "gemini")
+                self.assertTrue(rec_data["ai_generated"])
+                self.assertFalse(rec_data["is_fallback"])
+
+        # Task 4: Firestore query optimization — sessions with last_message_date_wib < yesterday_date
+        # or created_date_wib > yesterday_date must NOT have their messages subcollection queried!
+        old_chat = self.mock_db.collection("chats").document("old_session_oct")
+        old_chat.set({
+            "user": "patient_1",
+            "sessionID": "old_session_oct",
+            "title": "Sesi Lama Oktober",
+            "created_date_wib": "2026-10-01",
+            "last_message_date_wib": "2026-10-15",
+            "last_user_message_date_wib": "2026-10-15",
+        })
+        future_chat = self.mock_db.collection("chats").document("today_session_nov09")
+        future_chat.set({
+            "user": "patient_1",
+            "sessionID": "today_session_nov09",
+            "title": "Sesi Hari Ini",
+            "created_date_wib": "2026-11-09",
+            "last_message_date_wib": "2026-11-09",
+        })
+        legacy_chat = self.mock_db.collection("chats").document("legacy_session_no_meta")
+        legacy_chat.set({
+            "user": "patient_1",
+            "sessionID": "legacy_session_no_meta",
+            "title": "Sesi Legacy Tanpa Metadata Tanggal",
+        })
+        legacy_chat.collection("messages").document("leg_m1").set({
+            "role": "user",
+            "response": "Pesan riwayat lama pada tanggal 8 November",
+            "timestamp": "2026-11-08T05:00:00+00:00",
+        })
+
+        queried_subcollections = []
+        orig_collection_fn = self.mock_db.collection
+
+        def tracking_collection(name: str):
+            if "/messages" in name:
+                queried_subcollections.append(name)
+            return orig_collection_fn(name)
+
+        with patch.object(self.mock_db, "collection", side_effect=tracking_collection):
+            q_resp = self.client.get(
+                "/api/dashboard/yesterday-ai-summary?user_id=patient_1&date=2026-11-09",
+                headers=self._headers(self.token_p1),
+            )
+        self.assertEqual(q_resp.status_code, 200)
+        self.assertEqual(q_resp.json()["data"]["chat_sessions_total"], 1)
+        self.assertEqual(q_resp.json()["data"]["chat_messages_total"], 1)
+        self.assertIn("chats/legacy_session_no_meta/messages", queried_subcollections)
+        self.assertNotIn("chats/old_session_oct/messages", queried_subcollections)
+        self.assertNotIn("chats/today_session_nov09/messages", queried_subcollections)
+
+        # Task 5: Bounded in-memory coordination cache never exceeds MAX_LOCAL_COORDINATION_ENTRIES
+        # and overwrites obsolete signatures for the same (user_id, yesterday_date)
+        _RECENT_GENERATION_TS.clear()
+        now_dt = datetime.now(JAKARTA_TZ)
+        _record_local_generation_ts("patient_1", "2026-11-08", "sig_v1", now_dt)
+        _record_local_generation_ts("patient_1", "2026-11-08", "sig_v2", now_dt)
+        self.assertEqual(len(_RECENT_GENERATION_TS), 1)
+        self.assertEqual(_RECENT_GENERATION_TS[("patient_1", "2026-11-08")][0], "sig_v2")
+
+        for i in range(MAX_LOCAL_COORDINATION_ENTRIES + 50):
+            _record_local_generation_ts(f"user_{i}", "2026-11-08", f"sig_{i}", now_dt)
+        self.assertLessEqual(len(_RECENT_GENERATION_TS), MAX_LOCAL_COORDINATION_ENTRIES)
 
 
 if __name__ == "__main__":
