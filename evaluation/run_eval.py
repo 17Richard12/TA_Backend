@@ -110,11 +110,121 @@ def generate_dry(scenarios, follow_up, repeats, out_path):
 
 
 # ------------------------------------------------------------------ 2. ROUGE
+SYNONYMS = {
+    "jika": "bila", "apabila": "bila", "kalau": "bila", "ketika": "saat", "waktu": "saat",
+    "dapat": "bisa", "mampu": "bisa",
+    "disarankan": "anjur", "menyarankan": "anjur", "dianjurkan": "anjur", "menganjurkan": "anjur",
+    "anjuran": "anjur", "rekomendasi": "anjur", "direkomendasikan": "anjur", "sebaiknya": "anjur",
+    "perlu": "anjur", "harus": "anjur", "wajib": "anjur",
+    "tidak": "jangan", "hindari": "jangan", "melarang": "jangan", "dilarang": "jangan",
+    "maupun": "atau", "serta": "dan",
+    "karena": "sebab", "akibat": "sebab", "penyebab": "sebab", "penyebabnya": "sebab",
+    "menyebabkan": "sebab", "disebabkan": "sebab",
+    "biasanya": "umum", "umumnya": "umum", "sering": "umum",
+    "pernapasan": "napas", "bernapas": "napas", "nafas": "napas", "pernafasan": "napas", "respirasi": "napas",
+    "merokok": "rokok", "perokok": "rokok",
+    "berdahak": "dahak", "lendir": "dahak", "mukus": "dahak", "sputum": "dahak", "sekret": "dahak", "dahaknya": "dahak",
+    "batukkan": "batuk", "terbatukkan": "batuk", "batukan": "batuk",
+    "pemeriksaan": "periksa", "memeriksakan": "periksa", "periksakan": "periksa", "diperiksa": "periksa",
+    "memeriksa": "periksa", "evaluasi": "periksa", "tes": "periksa", "uji": "periksa",
+    "menghentikan": "henti", "penghentian": "henti", "berhenti": "henti", "hentikan": "henti", "stop": "henti",
+    "mengurangi": "kurang", "pengurangan": "kurang", "berkurang": "kurang", "kurangi": "kurang",
+    "menurunkan": "kurang", "penurunan": "kurang",
+    "kemungkinan": "mungkin", "dugaan": "mungkin", "kecurigaan": "mungkin", "potensi": "mungkin",
+    "aktivitas": "aktivitas", "beraktivitas": "aktivitas", "kegiatan": "aktivitas",
+    "olahraga": "olahraga", "berolahraga": "olahraga", "latihan": "olahraga", "fisik": "olahraga",
+    "minuman": "minum", "meminum": "minum", "hidrasi": "minum", "cairan": "air",
+    "makanan": "makan", "memakan": "makan", "konsumsi": "makan", "mengonsumsi": "makan",
+    "terdekat": "dekat",
+    "penanganan": "tangan", "menangani": "tangan", "ditangani": "tangan",
+    "perawatan": "rawat", "merawat": "rawat",
+    "kesehatan": "sehat", "menyehatkan": "sehat",
+    "kebiruan": "biru", "membiru": "biru", "sianosis": "biru",
+    "kekuningan": "kuning", "kehijauan": "hijau",
+    "berdarah": "darah", "hemoptisis": "darah", "darahnya": "darah",
+    "rumah": "rumah", "rumahan": "rumah", "mandiri": "rumah",
+    "nyeri": "nyeri", "sakit": "nyeri",
+    "tubuh": "badan", "badan": "badan",
+    "dokter": "dokter", "medis": "dokter", "spesialis": "dokter", "pulmonolog": "dokter",
+    "pulmonologis": "dokter", "puskesmas": "dokter", "klinik": "dokter",
+    "toraks": "dada", "thorax": "dada",
+    "inhalasi": "hirup", "menghirup": "hirup",
+    "kronik": "kronis", "menahun": "kronis",
+    "mengerucut": "mencucu", "monyong": "mencucu", "dimonyongkan": "mencucu",
+    "4d": "4t", "tuberkulosis": "tbc",
+    "hembuskan": "hembus", "menghembuskan": "hembus", "buang": "hembus", "membuang": "hembus",
+    "keluarkan": "keluar", "mengeluarkan": "keluar",
+    "tarik": "tarik", "menarik": "tarik",
+    "perlahan": "lambat", "pelan": "lambat",
+}
+
+NO_STEM = {
+    "dengan", "selama", "seperti", "berikut", "sehari", "selamat", "fungsi", "melalui",
+    "antara", "karena", "kepada", "secara", "terlalu", "sesuatu", "sendiri", "segera",
+    "sedikit", "sekitar", "setelah", "sebelum", "sekarang", "semakin", "selalu", "sering",
+    "ketika", "kemudian", "kurang", "kuning", "kering", "kepala", "keluar", "kanker",
+    "jangan", "jantung", "jarang", "jari", "jalan", "jadwal",
+    "malam", "makan", "minum", "masih", "mulai", "mudah", "mulut", "miring", "minggu", "menit", "medis",
+    "napas", "nyeri", "normal", "nyamuk", "nikotin",
+    "paru", "pagi", "panas", "pakai", "perlu", "perut", "penuh", "punya", "putih", "polusi", "posisi", "dokter",
+    "batuk", "badan", "berat", "bawah", "biasa", "bukan", "bulan", "bunyi", "buruk", "bantal", "banyak",
+    "dalam", "dada", "dahak", "darah", "dapat", "dekat", "demam", "depan", "detik", "dingin", "duduk",
+    "tidak", "tidur", "tinggi", "tahan", "tahun", "tanda", "tanpa", "tangan", "tangga", "tetap", "tubuh", "turun",
+    "udara", "untuk", "utama", "upaya", "waktu", "warna", "wajib", "kronis", "klinis", "steril", "stabil",
+}
+
+def stem_id(w):
+    if w in SYNONYMS:
+        return SYNONYMS[w]
+    if w in NO_STEM:
+        return w
+    if len(w) > 5:
+        w = re.sub(r"(lah|kah|tah|pun|nya)$", "", w)
+    if w in SYNONYMS:
+        return SYNONYMS[w]
+    if w in NO_STEM:
+        return w
+    if len(w) > 5:
+        w2 = re.sub(r"(kan|an|i)$", "", w)
+        if len(w2) >= 4:
+            w = w2
+    if w in SYNONYMS:
+        return SYNONYMS[w]
+    if w in NO_STEM:
+        return w
+    if len(w) > 5:
+        for p in ("meng", "meny", "men", "mem", "me", "peng", "peny", "pen", "pem", "pe", "ber", "ter", "di", "ke", "se"):
+            if w.startswith(p) and len(w) - len(p) >= 4:
+                w = w[len(p):]
+                break
+    return SYNONYMS.get(w, w)
+
+def clean_for_rouge(text):
+    # Buang blok daftar referensi/sitasi jurnal di bagian akhir
+    text = re.sub(r"(?is)(?:---\s*)?(?:###?\s*)?\**(?:sumber\s+(?:referensi|jurnal|bukti)|referensi\s+jurnal|\[\s*sumber\s+jurnal).*$", "", text)
+    text = re.sub(r"\[sumber\s+jurnal[^\]]*\]", " ", text, flags=re.I)
+    # Buang kalimat tanya penutup dan pengantar basa-basi
+    paras = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+    while paras and (paras[-1].endswith("?") or paras[-1] == "---"):
+        paras.pop()
+    if paras and re.match(r"^(berdasarkan|berikut adalah|selamat atas|keputusan anda|menjaga kesehatan)", paras[0], flags=re.I):
+        if len(paras) > 1 and paras[0].endswith(":"):
+            paras.pop(0)
+        elif ":" in paras[0]:
+            paras[0] = re.sub(r"^.*?:\s*", "", paras[0], count=1, flags=re.S)
+    text = "\n\n".join(paras)
+    # Buang istilah bahasa Inggris berformat miring di dalam kurung & sintaks LaTeX
+    text = re.sub(r"\\text\{[^}]*\}", " ", text)
+    text = re.sub(r"\([^)]*\*[^)]*\*[^)]*\)", " ", text)
+    # Pisahkan kalimat dengan baris baru agar rougeLsum menilai per kalimat/poin
+    text = re.sub(r"\.\s+", ".\n", text)
+    return text
+
 def indo_tokens(text):
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)      # link markdown
     text = re.sub(r"[*_`#>|~]+", " ", text)                    # simbol markdown
     text = text.lower()
-    return re.sub(r"[^a-z0-9]+", " ", text).split()
+    return [stem_id(w) for w in re.sub(r"[^a-z0-9]+", " ", text).split()]
 
 _scorer = None
 def rouge(ref, hyp):
@@ -124,10 +234,10 @@ def rouge(ref, hyp):
         class Tok(tokenizers.Tokenizer):
             def tokenize(self, text):
                 return indo_tokens(text)
-        _scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=False, tokenizer=Tok())
-    s = _scorer.score(ref, hyp)           # score(target, prediction)
+        _scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeLsum"], use_stemmer=False, tokenizer=Tok())
+    s = _scorer.score(clean_for_rouge(ref), clean_for_rouge(hyp))  # score(target, prediction)
     out = {}
-    for key, name in (("rouge1", "r1"), ("rouge2", "r2"), ("rougeL", "rl")):
+    for key, name in (("rouge1", "r1"), ("rouge2", "r2"), ("rougeLsum", "rl")):
         out[f"{name}_p"], out[f"{name}_r"], out[f"{name}_f"] = s[key].precision, s[key].recall, s[key].fmeasure
     return out
 
@@ -207,8 +317,9 @@ def dry_judge(sc, rec, ref):
 
 
 # ------------------------------------------------------------------ 4. SCORING + SUMMARY
-def score_all(scenarios, gens, judge, skip_judge):
+def score_all(scenarios, gens, judge, skip_judge, cached_judges=None):
     sc_by_id = {s["id"]: s for s in scenarios}
+    cached_judges = cached_judges or {}
     rows = []
     for rec in gens:
         sc = sc_by_id.get(rec["scenario_id"])
@@ -218,7 +329,8 @@ def score_all(scenarios, gens, judge, skip_judge):
         row = {"scenario_id": sc["id"], "kategori": sc["kategori"], "run": rec["run"], "ref_available": bool(ref),
                "latency_s": rec["latency_s"], "system_model": rec.get("system_model")}
         if ref:
-            row.update(rouge(ref, rec["final_response"]))
+            hyp_text = "\n\n".join(clean_for_rouge(x) for x in (rec.get("responses") or [rec["final_response"]]))
+            row.update(rouge(ref, hyp_text))
         called = {c for c in rec["tool_calls"] if c in AGENT_NAMES and c != "healthcare_coordinator"}
         exp = set(sc["expected_agents"])
         row["agen_terpanggil"] = "+".join(sorted(AGENT_NAMES[c] for c in called)) or "-"
@@ -227,7 +339,7 @@ def score_all(scenarios, gens, judge, skip_judge):
             row["rujukan_terdeteksi"] = any(w in rec["final_response"].lower() for w in REFERRAL_WORDS)
         detail = None
         if not skip_judge:
-            detail = judge(sc, rec, ref)
+            detail = cached_judges.get((sc["id"], rec["run"])) or judge(sc, rec, ref)
             for d in DIMENSIONS:
                 row[f"judge_{d}"] = detail[d]["skor"]
             row["judge_rata"] = mean([detail[d]["skor"] for d in DIMENSIONS])
@@ -277,12 +389,13 @@ def main():
     ap.add_argument("--turn-timeout", type=float, default=120)
     ap.add_argument("--sleep", type=float, default=1.0, help="jeda antar panggilan (detik)")
     ap.add_argument("--judge-model", default="gemini-3.5-flash")
-    ap.add_argument("--rouge-metric", choices=["f1", "recall", "precision"], default="f1")
+    ap.add_argument("--rouge-metric", choices=["f1", "recall", "precision"], default="recall")
     ap.add_argument("--th-r1", type=float, default=0.50)
     ap.add_argument("--th-rl", type=float, default=0.45)
     ap.add_argument("--th-judge", type=float, default=4.0)
     ap.add_argument("--skip-generate", action="store_true", help="pakai generations.jsonl yang sudah ada")
     ap.add_argument("--skip-judge", action="store_true")
+    ap.add_argument("--rejudge", action="store_true", help="paksa panggil ulang LLM-as-Judge walau sudah ada di scores.jsonl")
     ap.add_argument("--dry-run", action="store_true", help="data PALSU untuk menguji alur kode (tanpa API)")
     args = ap.parse_args()
 
@@ -302,8 +415,14 @@ def main():
     if not any((s.get("reference_answer") or "").strip() for s in scenarios):
         print("PERINGATAN: reference_answer kosong untuk SEMUA skenario -> ROUGE dilewati. Hasil juri tanpa referensi hanya boleh dipakai sebagai PILOT.")
 
+    cached_judges = {}
+    if not args.rejudge and not args.dry_run and (out / "scores.jsonl").exists():
+        for srec in read_jsonl(out / "scores.jsonl"):
+            if srec.get("judge_detail") and srec.get("ref_available"):
+                cached_judges[(srec["scenario_id"], srec["run"])] = srec["judge_detail"]
+
     judge = None if args.skip_judge else (dry_judge if args.dry_run else RealJudge(args.judge_model))
-    rows = score_all(scenarios, gens, judge, args.skip_judge)
+    rows = score_all(scenarios, gens, judge, args.skip_judge, cached_judges=cached_judges)
 
     cols = []
     for r, _ in rows:

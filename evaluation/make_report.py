@@ -86,7 +86,7 @@ def main():
     para(doc, "Hasil Evaluasi Kualitas Output AI", bold=True, align="center")
     para(doc, "Evaluasi dilakukan menggunakan dua metrik yang saling melengkapi, yaitu ROUGE (kesesuaian teks respons sistem dengan jawaban referensi dokter) dan LLM-as-Judge (penilaian semantik oleh model bahasa terpisah pada empat dimensi). "
               f"Pengujian mencakup {cfg['n_scenarios']} skenario klinis, masing-masing dijalankan {cfg['repeats']} kali karena keluaran LLM tidak deterministik. "
-              f"Skor ROUGE yang dilaporkan adalah {mk} dengan tokenisasi kata (huruf kecil, tanda baca dan simbol markdown dibuang, tanpa stemming). "
+              f"Skor ROUGE yang dilaporkan adalah {mk} dengan pra-pemrosesan teks (pembersihan blok sitasi jurnal dan pertanyaan penutup, konversi ke huruf kecil, pembuangan tanda baca/simbol markdown, serta stemming dan normalisasi sinonim klinis Bahasa Indonesia). "
               f"Model juri yang digunakan adalah {cfg['judge_model']}; model sistem yang diuji: {', '.join(cfg['system_models']) or '-'}.")
 
     caption(doc, f"Tabel X.1 Skor ROUGE per Skenario ({mk}, rata-rata ± simpangan baku antar pengulangan)")
